@@ -16,3 +16,4 @@
 /runspace
 /reference
 .geminiignore
+.playwright-mcp

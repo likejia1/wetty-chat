@@ -56,7 +56,9 @@ import {
 import { messageAdded, messageConfirmed, messagePatched, reactionsUpdated } from '@/store/messageEvents';
 import type { RootState } from '@/store/index';
 import store from '@/store/index';
-import { type VirtualScrollAnchor, type VirtualScrollHandle, VirtualScroll } from '@/components/chat/VirtualScroll';
+import { ChatVirtualScroll } from '@/components/chat/ChatVirtualScroll';
+import type { ChatRow, VirtualScrollAnchor, VirtualScrollHandle } from '@/components/chat/virtualScroll/types';
+import { useChatRows } from '@/components/chat/useChatRows';
 import { ChatBubble } from '@/components/chat/ChatBubble';
 import {
   type ComposeSendPayload,
@@ -175,11 +177,9 @@ function ChatThreadCore({ chatId, threadId, backAction }: ChatThreadCoreProps) {
   const [loadingMore, setLoadingMore] = useState(false);
   const loadingMoreRef = useRef(false);
   const loadingNewerRef = useRef(false);
-  const pendingPrependRef = useRef<{ messages: MessageResponse[]; nextCursor: string | null; gen: number } | null>(
-    null,
-  );
-  const isScrollIdleRef = useRef(true);
   const [initialAnchor, setInitialAnchor] = useState<VirtualScrollAnchor>({ type: 'bottom', token: 0 });
+
+  const chatRows = useChatRows(messages, formatDateSeparator);
 
   const [atBottom, setAtBottom] = useState(true);
   const [replyingTo, setReplyingTo] = useState<MessageResponse | null>(null);
@@ -191,7 +191,7 @@ function ChatThreadCore({ chatId, threadId, backAction }: ChatThreadCoreProps) {
   const [presentAlert] = useIonAlert();
   const [overlayMessage, setOverlayMessage] = useState<{ message: MessageResponse; sourceRect: DOMRect } | null>(null);
 
-  const getMessageKey = useCallback((message: MessageResponse) => message.client_generated_id || message.id, []);
+  const getMessageKey = useCallback((message: MessageResponse) => `msg:${message.client_generated_id || message.id}`, []);
 
   const startEditingMessage = useCallback((message: MessageResponse) => {
     setReplyingTo(null);
@@ -263,12 +263,10 @@ function ChatThreadCore({ chatId, threadId, backAction }: ChatThreadCoreProps) {
             prevCursor: null,
           }),
         );
-        pendingPrependRef.current = null;
         setInitialAnchor((currentAnchor) => ({ type: 'bottom', token: currentAnchor.token + 1 }));
       })
       .catch((err: Error) => {
         dispatch(resetChat({ chatId: storeChatId, messages: [], nextCursor: null, prevCursor: null }));
-        pendingPrependRef.current = null;
         setInitialAnchor((currentAnchor) => ({ type: 'bottom', token: currentAnchor.token + 1 }));
         showToast(err.message || t`Failed to load messages`);
       });
@@ -279,26 +277,10 @@ function ChatThreadCore({ chatId, threadId, backAction }: ChatThreadCoreProps) {
     fetchLatestWindow();
   }, [chatId, fetchLatestWindow]);
 
-  const flushPendingPrepend = useCallback(() => {
-    const pending = pendingPrependRef.current;
-    if (!pending) return;
-    pendingPrependRef.current = null;
-    if (selectChatGeneration(store.getState(), storeChatId) !== pending.gen) return;
-    dispatch(prependMessages({ chatId: storeChatId, messages: pending.messages, nextCursor: pending.nextCursor }));
-    loadingMoreRef.current = false;
-    setLoadingMore(false);
-  }, [storeChatId, dispatch]);
-
-  const handleScrollIdle = useCallback(() => {
-    isScrollIdleRef.current = true;
-    flushPendingPrepend();
-  }, [flushPendingPrepend]);
-
   const loadMore = useCallback(() => {
     const st = store.getState();
     const cursor = selectNextCursorForChat(st, storeChatId);
     if (!chatId || cursor == null || loadingMoreRef.current) return;
-    isScrollIdleRef.current = false;
     const gen = selectChatGeneration(st, storeChatId);
     loadingMoreRef.current = true;
     setLoadingMore(true);
@@ -306,16 +288,9 @@ function ChatThreadCore({ chatId, threadId, backAction }: ChatThreadCoreProps) {
       .then((res) => {
         if (selectChatGeneration(store.getState(), storeChatId) !== gen) return;
         const list = res.data.messages ?? [];
-        const pending = { messages: list, nextCursor: res.data.next_cursor ?? null, gen };
-        if (isScrollIdleRef.current) {
-          // Scroll already stopped — flush immediately
-          dispatch(prependMessages({ chatId: storeChatId, messages: list, nextCursor: pending.nextCursor }));
-          loadingMoreRef.current = false;
-          setLoadingMore(false);
-        } else {
-          // Buffer until scroll idle
-          pendingPrependRef.current = pending;
-        }
+        dispatch(prependMessages({ chatId: storeChatId, messages: list, nextCursor: res.data.next_cursor ?? null }));
+        loadingMoreRef.current = false;
+        setLoadingMore(false);
       })
       .catch((err: Error) => {
         showToast(err.message || t`Failed to load more`);
@@ -389,8 +364,7 @@ function ChatThreadCore({ chatId, threadId, backAction }: ChatThreadCoreProps) {
               prevCursor: res.data.prev_cursor ?? null,
             }),
           );
-          pendingPrependRef.current = null;
-          setInitialAnchor((currentAnchor) => ({ type: 'item', key: messageId, token: currentAnchor.token + 1 }));
+          setInitialAnchor((currentAnchor) => ({ type: 'item', key: `msg:${messageId}`, token: currentAnchor.token + 1 }));
         })
         .catch((err: Error) => {
           showToast(err.message || t`Failed to jump to message`);
@@ -577,10 +551,9 @@ function ChatThreadCore({ chatId, threadId, backAction }: ChatThreadCoreProps) {
     ],
   );
 
-  const onClickChatItem = (messageIndex: number, sourceRect: DOMRect) => {
-    const msg = messages[messageIndex];
+  const onClickChatItem = useCallback((msg: MessageResponse, sourceRect: DOMRect) => {
     setOverlayMessage({ message: msg, sourceRect });
-  };
+  }, []);
 
   const overlayActions = useMemo((): MessageOverlayAction[] => {
     if (!overlayMessage) return [];
@@ -663,6 +636,60 @@ function ChatThreadCore({ chatId, threadId, backAction }: ChatThreadCoreProps) {
     return actions;
   }, [overlayMessage, currentUserId, threadId, chatId, history, dispatch, showToast, presentAlert, startEditingMessage]);
 
+  const renderRow = useCallback(
+    (row: ChatRow) => {
+      if (row.type === 'date') {
+        return (
+          <div className="chat-date-separator">
+            <span>{row.dateLabel}</span>
+          </div>
+        );
+      }
+
+      const msg = row.message;
+      return (
+        <ChatBubble
+          senderName={msg.sender.name ?? `User ${msg.sender.uid}`}
+          senderGender={msg.sender.gender}
+          senderGroup={msg.sender.user_group}
+          message={msg.is_deleted ? t`[Deleted]` : (msg.message ?? '')}
+          isSent={msg.sender.uid === currentUserId}
+          avatarUrl={msg.sender.avatar_url}
+          onReply={() => setReplyingTo(msg)}
+          onReplyTap={
+            msg.reply_to_message && !msg.reply_to_message?.is_deleted
+              ? () => jumpToMessage(msg.reply_to_message!.id)
+              : undefined
+          }
+          onLongPress={(rect) => onClickChatItem(msg, rect)}
+          showName={row.showName}
+          showAvatar={row.showAvatar}
+          timestamp={msg.created_at}
+          edited={msg.is_edited}
+          threadInfo={!threadId ? msg.thread_info : undefined}
+          onThreadClick={() => history.push(`/chats/chat/${chatId}/thread/${msg.id}`)}
+          onAvatarClick={() => setProfileSender(msg.sender)}
+          attachments={msg.attachments}
+          isConfirmed={!msg.id.startsWith('cg_')}
+          reactions={msg.reactions}
+          onReactionToggle={(emoji, currentlyReacted) => handleReactionToggle(msg, emoji, currentlyReacted)}
+          replyTo={
+            msg.reply_to_message
+              ? {
+                  senderName: msg.reply_to_message.sender.name ?? `User ${msg.reply_to_message.sender.uid}`,
+                  message: msg.reply_to_message.message,
+                  attachments:
+                    messageLookup.get(msg.reply_to_message.id)?.attachments ?? msg.reply_to_message.attachments,
+                  isDeleted: msg.reply_to_message.is_deleted,
+                }
+              : undefined
+          }
+        />
+      );
+    },
+    [currentUserId, threadId, chatId, history, jumpToMessage, onClickChatItem, handleReactionToggle, messageLookup],
+  );
+
   return (
     <div className="ion-page chat-thread-page">
       <IonHeader>
@@ -689,98 +716,15 @@ function ChatThreadCore({ chatId, threadId, backAction }: ChatThreadCoreProps) {
       </IonHeader>
 
       <IonContent className="chat-thread-content" scrollX={false} scrollY={false}>
-        <VirtualScroll
-          items={messages}
+        <ChatVirtualScroll
+          rows={chatRows}
+          renderRow={renderRow}
           initialAnchor={initialAnchor}
           loadOlder={{ hasMore: nextCursor != null, loading: loadingMore, onLoad: loadMore }}
           loadNewer={prevCursor != null ? { hasMore: true, onLoad: loadNewer } : undefined}
           scrollApiRef={scrollApiRef}
           bottomPadding={16}
           onAtBottomChange={setAtBottom}
-          onScrollIdle={handleScrollIdle}
-          getItemKey={(message: MessageResponse) => getMessageKey(message)}
-          renderItem={(msg: MessageResponse, index: number) => {
-            const prevMsg = index > 0 ? messages[index - 1] : null;
-            const nextMsg = index < messages.length - 1 ? messages[index + 1] : null;
-
-            const prevSender = prevMsg ? prevMsg.sender.uid : null;
-            const nextSender = nextMsg ? nextMsg.sender.uid : null;
-
-            let showDateSeparator = false;
-            if (index === 0) {
-              showDateSeparator = true;
-            } else if (prevMsg) {
-              const d1 = new Date(msg.created_at);
-              const d2 = new Date(prevMsg.created_at);
-              if (
-                d1.getFullYear() !== d2.getFullYear() ||
-                d1.getMonth() !== d2.getMonth() ||
-                d1.getDate() !== d2.getDate()
-              ) {
-                showDateSeparator = true;
-              }
-            }
-
-            let isLastInGroup = nextSender !== msg.sender.uid;
-            if (!isLastInGroup && nextMsg) {
-              const d1 = new Date(msg.created_at);
-              const d2 = new Date(nextMsg.created_at);
-              if (
-                d1.getFullYear() !== d2.getFullYear() ||
-                d1.getMonth() !== d2.getMonth() ||
-                d1.getDate() !== d2.getDate()
-              ) {
-                isLastInGroup = true;
-              }
-            }
-
-            return (
-              <>
-                {showDateSeparator && (
-                  <div className="chat-date-separator">
-                    <span>{formatDateSeparator(msg.created_at)}</span>
-                  </div>
-                )}
-                <ChatBubble
-                  senderName={msg.sender.name ?? `User ${msg.sender.uid}`}
-                  senderGender={msg.sender.gender}
-                  senderGroup={msg.sender.user_group}
-                  message={msg.is_deleted ? t`[Deleted]` : (msg.message ?? '')}
-                  isSent={msg.sender.uid === currentUserId}
-                  avatarUrl={msg.sender.avatar_url}
-                  onReply={() => setReplyingTo(msg)}
-                  onReplyTap={
-                    msg.reply_to_message && !msg.reply_to_message?.is_deleted
-                      ? () => jumpToMessage(msg.reply_to_message!.id)
-                      : undefined
-                  }
-                  onLongPress={(rect) => onClickChatItem(index, rect)}
-                  showName={prevSender !== msg.sender.uid || showDateSeparator}
-                  showAvatar={isLastInGroup}
-                  timestamp={msg.created_at}
-                  edited={msg.is_edited}
-                  threadInfo={!threadId ? msg.thread_info : undefined}
-                  onThreadClick={() => history.push(`/chats/chat/${chatId}/thread/${msg.id}`)}
-                  onAvatarClick={() => setProfileSender(msg.sender)}
-                  attachments={msg.attachments}
-                  isConfirmed={!msg.id.startsWith('cg_')}
-                  reactions={msg.reactions}
-                  onReactionToggle={(emoji, currentlyReacted) => handleReactionToggle(msg, emoji, currentlyReacted)}
-                  replyTo={
-                    msg.reply_to_message
-                      ? {
-                          senderName: msg.reply_to_message.sender.name ?? `User ${msg.reply_to_message.sender.uid}`,
-                          message: msg.reply_to_message.message,
-                          attachments:
-                            messageLookup.get(msg.reply_to_message.id)?.attachments ?? msg.reply_to_message.attachments,
-                          isDeleted: msg.reply_to_message.is_deleted,
-                        }
-                      : undefined
-                  }
-                />
-              </>
-            );
-          }}
         />
         <IonFab
           vertical="bottom"

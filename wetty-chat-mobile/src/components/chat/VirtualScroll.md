@@ -1,374 +1,155 @@
-# Chat Virtual Scroll Redesign
+# Chat Virtual Scroll — Design & Implementation Notes
 
-This component is for the chat thread UI, not for generic feed virtualization. The design should optimize for chat correctness first, while still avoiding the "measure the whole store on first render" failure that the older implementation had.
+This is the chat message list virtualizer for `ChatVirtualScroll.tsx`. It is chat-specific, not a generic virtual scroll. This document records the architecture, key decisions, and lessons learned during implementation.
 
-## What we learned from the two versions
+## Architecture: "Measured Core" Model
 
-The older Fenwick-tree version got a few important things right:
+### Why not estimated spacers
 
-- it had a stable global height model for the whole loaded window
-- it could keep DOM size bounded to the visible area
-- it handled scroll-to-index and thumb dragging naturally because the full scroll range existed
+The original design doc proposed a sparse global height tree with estimates for unmeasured rows. This was rejected because **iOS Safari ignores programmatic `scrollTop` changes during momentum scroll**. When estimates are corrected to real heights, content shifts. Correcting via `scrollTop` fails during momentum. Letting it shift is a visible glitch.
 
-But it paid for that by rendering every item invisibly during the initial measuring phase. That is exactly what hurts when the store already contains a large loaded window.
+### What we use instead
 
-The current committed-frontier rewrite fixed the startup cost:
+Only measured content participates in scroll geometry. Unmeasured regions are hidden behind fixed-height opaque boundary spinners. The scroll range grows as we measure more content, rather than being pre-estimated.
 
-- it only measures small hidden batches
-- it preserves more invariants around "only measured rows affect visible layout"
-- it moved network loading policy out to the parent, which is the right direction
+This means:
+- No estimate-to-real correction ever needed in the visible area
+- No programmatic `scrollTop` adjustment for measurement corrections
+- The scroll thumb won't represent the full chat history (acceptable for chat)
+- `scrollTop` adjustment is ONLY needed for prepend preservation (adding measured height above viewport)
 
-But it now carries too much chat behavior inside one frontier-expansion model:
+## Three-Tier Data Model
 
-- local reveal, network prepend, append, jump, and reset all interact through the same committed range
-- there is no stable global geometry outside the committed frontier
-- the committed frontier only grows, so complexity and mounted DOM grow over time
-- imperative jumps and thumb teleports are awkward because the visible world only exists where the frontier has already been measured
+### Tier 1: Full rows array (`ChatRow[]`)
+All messages in the current store window transformed into flat rows (date separators + message rows). Possibly thousands of items. Only used for key lookups and to know what exists.
 
-## Design goal
+### Tier 2: Measured core (`CoreRange { start, end }`)
+A contiguous subset of rows that have been measured and participate in scroll geometry. Heights stored in a persistent keyed cache. Starts small at bootstrap, grows as user scrolls. Bounded by `CORE_CAP` (~200 rows) with pruning from the far side.
 
-We want all of these at once:
+The height cache is **never pruned** — it persists for the lifetime of the chat session. When core is pruned, heights remain in the cache. Re-expansion of previously measured regions is instant (no staging needed).
 
-1. No all-items measuring pass on initial load.
-2. Stable, chat-correct scroll preservation for prepend, append, resize, jump, and optimistic confirmation.
-3. A real global scroll range so dragging, jumping, and bottom anchoring feel natural.
-4. A bounded mounted DOM so long sessions do not keep growing forever.
-5. Clear separation between virtualizer geometry and page-level network policy.
+### Tier 3: Mounted window (`MountedWindow { start, end }`)
+A contiguous subset of the core with actual DOM nodes. Bounded by `MOUNT_CAP` (~80 rows). Rows in the core but outside the mounted window use spacers with their exact measured heights.
 
-## Proposed architecture
+## Row Model
 
-Use a hybrid model:
+Date separators are separate `ChatRow` entries computed by `useChatRows()`.
 
-- a sparse global height model for all logical rows
-- a bounded measured window around the viewport
-- top and bottom spacer blocks for everything outside that window
-- a small hidden staging batch for rows that are about to enter the mounted window
+Key scheme:
+- First message's date separator: `datefirst:YYYY-MM-DD` (distinct prefix to avoid collision on prepend)
+- Date boundary separators: `date:YYYY-MM-DD`
+- Message rows: `msg:${client_generated_id || id}`
 
-This keeps the good part of the old spacer/tree approach without the "measure everything first" cost, and keeps the good part of the current staging approach without making the entire scroll model depend on a single ever-growing frontier.
+The `datefirst:` prefix exists because when messages are prepended on the same date, the date separator key would collide if it used the same `date:` prefix. See "Mutation Classification" below for why this matters.
 
-## Row model
+## State Machine
 
-`chat-thread.tsx` should stop treating "date separator + message bubble" as one virtual row.
+```
+WAITING_VIEWPORT  -->  BOOTSTRAP  -->  READY
+                                        |  ^
+                                        v  |
+                                    RECENTERING
+```
 
-Instead, build a flat `ChatRow[]` model such as:
+## Key Design Decisions & Lessons Learned
 
-- `date:${yyyy-mm-dd}`
-- `msg:${client_generated_id || id}`
+### 1. No core expansion during active scrolling
 
-Benefits:
+**Problem**: Expanding the core during scroll events (`handleScroll`) requires `scrollTop += delta` for scroll preservation. This fights with iOS momentum scrolling and creates a feedback loop (scroll event -> expand -> scrollTop change -> scroll event -> expand...).
 
-- one DOM measurement unit maps to one virtual row
-- separator rows have stable keys and predictable heights
-- message rows keep stable identity across optimistic confirmation
-- height estimation can be row-type aware
-- scroll-to-message can target the exact message row key
+**Solution**: `handleScroll` only does mounted window recomputation (which rows within the existing core to render). All core expansion happens in `handleScrollIdle` (150ms debounce after last scroll event). This means the user momentum-scrolls freely without any `scrollTop` interference.
 
-The virtualizer should operate on `ChatRow[]`, not raw messages.
+### 2. Network loads deferred to scroll idle with one-shot arming
 
-## Core data structures
+**Problem**: Triggering `loadOlder.onLoad()` during active scrolling caused two issues:
+1. After fetch + prepend + local expansion, user is still near top -> immediate re-fetch -> infinite loop
+2. After fetch + prepend, user is stopped at top with no scroll events -> new rows never expand
 
-### 1. Keyed height cache
+**Solution**: Network fetches are deferred to scroll idle (`handleScrollIdle`), gated by a one-shot arm (`topLoadArmedRef`/`bottomLoadArmedRef`). The arm is set to `false` after a load fires and only re-armed when the user scrolls away from the edge (`scrollDistFromTop >= VIEWPORT_TRIGGER_PX`). This prevents re-triggering while the user is parked at the edge.
 
-- `measuredHeightByKey: Map<string, number>`
-- survives append, prepend, jump windows, and optimistic confirmation
-- keyed by stable row key, never by array index
+### 3. Immediate store commit for prepends (no buffering)
 
-### 2. Sparse height tree
+**Problem**: The V2 code buffered prepend data in `pendingPrependRef` until scroll idle. This caused "one bad commit" issues where the virtualizer's key arrays were out of sync with the store.
 
-- one entry per logical row in the current `items`
-- each entry is either:
-  - measured height from the cache
-  - estimated height from a chat-specific estimator
-- supports:
-  - `offsetOf(index)`
-  - `indexAtOffset(scrollTop)`
-  - `totalHeight()`
+**Solution**: `prependMessages` dispatches to the store immediately. The virtualizer handles the visual timing — new rows enter the core via normal staging batches. The store is never stale.
 
-This restores a global geometry model without requiring every row to be measured first.
+### 4. Render-time index adjustment for prepends
 
-### 3. Mounted window
+**Problem**: When `rowKeys` changes due to prepend, array indices shift but `coreRef` and `mountedRef` still hold old indices. If not corrected before JSX is produced, the component renders the wrong rows (shows prepended/older messages instead of the ones the user was looking at).
 
-- `windowRange = { start, end }`
-- contiguous block of mounted rows around the viewport
-- contains only measured rows plus a small overscan
-- hard size cap so the DOM does not grow forever
+**Why `useEffect` doesn't work**: The layout effect updates `prevKeysRef` before the mutation `useEffect` reads it, so the mutation effect never detects the prepend. Even if it did, `useEffect` runs after render — too late.
 
-### 4. Hidden staging batch
+**Solution**: A synchronous block during the render phase (before JSX) detects prepend via `classifyKeyMutation` using a separate `adjustPrevKeysRef`, then shifts `core.start/end` and `mounted.start/end` by the prepend count. This only fires when `rowKeys` reference changes (store update), NOT on internal re-renders from `triggerRender()`.
 
-- `pendingBatch = { direction | recenter, keys[] }`
-- rows render in a hidden staging lane only for measurement
-- commit happens atomically once the whole batch is measured
+**Important**: An earlier attempt used key-based re-alignment (tracking `coreStartKeyRef`/`coreEndKeyRef` and re-resolving indices every render). This caused an infinite loop because it couldn't distinguish "indices changed due to prepend" from "indices changed due to normal core expansion" — it would undo expansions on every render.
 
-### 5. Scroll anchor snapshot
+### 5. Mutation classification filters out date keys
 
-- `anchorKey`
-- `anchorOffsetWithinViewport`
-- optional `anchorMode = preserve | bottom | item`
+**Problem**: `classifyKeyMutation` uses `isSuffix(oldKeys, newKeys)` to detect prepend. But when prepended messages share a date with existing messages, date separator keys (`date:YYYY-MM-DD`) shift position, causing `isSuffix` to return false and misclassifying the prepend as a `reset` (which scrolls to bottom).
 
-This is the source of truth for prepend preservation and recenter operations.
+**Solution**: `classifyKeyMutation` filters to `msg:`-prefixed keys only before comparing. Message keys are stable across prepend; date separator keys are not. The prependCount for index shifting still uses full `rowKeys.length` difference.
 
-## Estimation strategy
+### 6. MeasuredRow registration in useLayoutEffect
 
-Unmeasured rows outside the mounted window should use estimates, but visible rows should still be measured before they are promoted into the mounted window.
+**Problem**: `scrollToKeyInternal` looks up the target row in `rowRefsMap`. But `MeasuredRow` originally registered nodes in `useEffect`, which runs AFTER the parent's `useLayoutEffect`. So the parent's layout effect tries to scroll to a key that isn't registered yet.
 
-Recommended estimator tiers:
+**Solution**: Split `MeasuredRow` into two effects:
+- `useLayoutEffect` for row registration (`registerRow`) — available to parent's layout effect
+- `useEffect` for `ResizeObserver` — doesn't need to run before paint, avoids flushSync-in-lifecycle errors
 
-- date separator: fixed small height
-- plain text message: default medium height
-- deleted message: small height
-- message with attachments: larger estimate
-- message with reply preview: slightly larger estimate
+### 7. Bootstrap needs content on BOTH sides of item anchor
 
-The estimator does not need to be perfect. Its job is to keep the scroll range stable enough until real measurements arrive.
-
-## State machine
-
-Keep the lifecycle simple:
-
-- `WAITING_VIEWPORT`
-- `BOOTSTRAP`
-- `READY`
-- `RECENTERING`
-
-Do not encode prepend-vs-reveal-vs-fetch as top-level phases. Those are layout intents, not lifecycle phases.
-
-## Bootstrap
-
-### Bottom-open
-
-1. Wait for a real viewport height.
-2. Seed a small tail range near the last row, for example 12 to 16 rows.
-3. Measure only that seed in hidden staging.
-4. If measured seed height is still less than about `1.5 * viewportHeight`, extend backward in small batches.
-5. Reveal once:
-   - the anchor row is measured
-   - the mounted window covers enough real height for the first paint
-
-Everything outside the mounted window is represented by spacer estimates, not by hidden full-list measurement.
-
-### Jump-to-message
-
-1. Resolve the target key in the current logical rows.
-2. Enter `RECENTERING`.
-3. Seed a small range around the target key.
-4. Measure that range in staging.
-5. Reveal with the target row anchored into view.
-
-Do not drain batch-by-batch from the current frontier to reach the target.
-
-## Ready-state scrolling
-
-### Normal scrolling
-
-The visible list is:
-
-- top chrome
-- top spacer
-- mounted measured rows
-- bottom spacer
-
-When the user nears the top or bottom edge of the mounted window:
-
-1. queue a small adjacent staging batch
-2. measure it hidden
-3. commit it atomically
-4. prune rows from the far side if the window exceeds its cap
-
-Good starting numbers:
-
-- batch size: 8 to 12 rows
-- overscan: 4 to 8 rows
-- mounted cap: around 60 to 100 rows, or about `3x` viewport height
-
-The important rule is that mounted rows are bounded.
-
-### Thumb teleport / large fling
-
-If the viewport lands far outside the mounted window according to `indexAtOffset(scrollTop)`:
-
-1. keep the current scrollTop
-2. compute an estimated target index from the height tree
-3. enter `RECENTERING`
-4. replace the mounted window with a newly measured seed around that index
-
-This is the missing piece in the current frontier-only design.
-
-## Mutation classification
-
-Classify mutations only from stable keys in the same render:
-
-- `none`
-- `prepend`
-- `append`
-- `reset`
-
-Do not use:
-
-- `prependedCount`
-- delayed side channels
-- "we fetched older so it must be a prepend"
-
-The rows themselves are the source of truth.
-
-## Scroll preservation rules
-
-### Real prepend from the server
-
-When rows are inserted above the viewport:
-
-1. capture the first visible measured row key before commit
-2. capture its offset relative to `scrollTop`
-3. after the prepend render, restore that same row to the same relative offset in the same layout cycle
-
-This must happen before paint.
-
-### Local window expansion above the viewport
-
-If we are only mounting already-loaded rows from the local gap:
-
-- preserve viewport using height delta or row anchor
-- do not treat this like a network prepend
-
-### Append while at bottom
-
-If the user is at bottom, or a bottom-scroll intent is active:
-
-- keep the last row pinned to the bottom
-- do not let estimator correction pull the viewport upward
-
-### Row resize after mount
-
-If a measured row changes height:
-
-- at bottom: snap to bottom
-- above viewport: add the height delta to `scrollTop`
-- inside viewport: allow natural reflow
-
-### Top chrome changes
-
-Header height and loading-row height must be modeled separately from row height.
-
-If top chrome changes in the same render as prepend or local expansion, anchor preservation still wins.
-
-## Network ownership split
-
-`VirtualScroll` should own:
-
-- row measurement
-- height tree updates
-- mounted window management
-- spacer sizing
-- layout preservation
-- imperative scroll APIs
-- boundary state reporting
-
-`chat-thread.tsx` should own:
-
-- `getMessages(...)`
-- cursor state
-- one-load-per-stop arming
-- deciding when older/newer fetches are allowed
-- jump-to-message window fetches
-
-The virtualizer reports geometry. The page decides whether to hit the network.
-
-## Recommended virtualizer API
-
-Keep the current key-oriented API direction, but make it explicitly chat-focused:
-
-- `rows`
-- `getRowKey(row)`
-- `estimateRowHeight(row)`
-- `renderRow(row)`
-- `initialAnchor`
-- `scrollApiRef`
-- `loadingOlder`
-- `header`
-- `bottomPadding`
-- `onAtBottomChange`
-- `onBoundaryStateChange`
-
-`onBoundaryStateChange` should stay simple:
-
-- `nearTop`
-- `nearBottom`
-- `hasLocalOlderGap`
-- `hasLocalNewerGap`
-- `atBottom`
-
-That is enough for the page to decide whether to reveal local rows or fetch a page.
-
-## Changes needed in `chat-thread.tsx`
-
-### 1. Build chat rows up front
-
-Memoize a `ChatRow[]` structure from `messages`.
-
-That row builder should also compute:
-
-- grouping flags for message rows
-- date separator rows
-- per-row estimate hints if needed
-
-### 2. Scroll by row key, not message index
-
-The current key-based API is the right long-term direction. Keep that.
-
-### 3. Keep boundary arming in the page
-
-The current `topIdleLoadArmedRef` / `bottomIdleLoadArmedRef` pattern is still useful. The virtualizer should not fetch directly.
-
-### 4. Do not buffer fetched prepends behind scroll idle inside the page
-
-Once older messages arrive, commit them to the store immediately and let the virtualizer preserve the viewport. Delaying the data mutation is what caused earlier "one bad commit" behavior.
-
-## Why this design should fix the current problems
-
-It avoids the old startup regression because we never measure the whole loaded list.
-
-It avoids the current rewrite's scroll issues because:
-
-- there is always a global scroll geometry model
-- prepend preservation is key-anchored, not frontier-count based
-- jump and thumb teleport can recenter directly instead of batch-draining
-- local reveal and real prepend remain separate behaviors
-- the mounted DOM stays bounded instead of growing with the frontier
-
-## Implementation split
-
-If this is rewritten, split it into smaller pieces:
-
-- `useChatRowHeights`
-- `useHeightTree`
-- `useMountedWindow`
-- `useScrollPreservation`
-- `useBoundaryState`
-
-The current file is doing too many jobs in one component, which makes chat edge cases hard to reason about.
-
-## Rollout plan
-
-1. Change `chat-thread.tsx` to build explicit `ChatRow[]` items.
-2. Reintroduce a global height tree, but seed it from estimates instead of measuring all rows first.
-3. Replace the ever-growing committed frontier with a bounded mounted window plus spacers.
-4. Keep hidden staging batches, but only for rows about to enter the mounted window or a recenter target.
-5. Preserve prepend/append behavior with keyed row anchors in layout effects.
-6. Verify:
-   - initial open at bottom
-   - jump to older message
-   - fetch older while parked at top
-   - fast fling to top then stop
-   - composer height changes
-   - image load / attachment resize
-   - optimistic send and confirm
-
-## Invariants to keep
-
-- stable row keys are the source of truth
-- visible rows should be measured before they are committed into the mounted window
-- prepend preservation happens before paint
-- local reveal and server prepend are different behaviors
-- network loading remains parent policy
-- optimistic confirmation must not remount a row
-
-If a rewrite cannot clearly explain how it keeps those invariants while supporting a global scroll range and a bounded mounted window, it is probably still missing a chat-specific edge case.
+**Problem**: When jumping to an old message, `createBootstrapBatch` originally only seeded rows backward from the anchor. The anchor ended up at the bottom of the core with no content below. `scrollToKeyInternal` couldn't position the target at the top of the viewport because `scrollTop` was clamped by `scrollHeight - clientHeight`.
+
+**Solution**:
+- `createBootstrapBatch` seeds rows both before AND after the anchor (`anchorIndex +/- halfBatch`)
+- The bootstrap effect prefers forward expansion for item anchors (to build scroll range below target)
+- The bootstrap completion check (`handleBatchReady`) requires `heightAfterAnchor >= viewportHeight` for item anchors before declaring bootstrap complete
+- The bootstrap effect mirrors this check to avoid a deadlock where total height is sufficient but below-anchor height is not
+
+### 8. scrollToBottom provides immediate visual feedback
+
+**Problem**: `scrollToBottom()` checked `hasNewerGap()` first. If the core didn't extend to the last row, it called `maybeExpandOrQueue('forward')` and returned without scrolling — the user perceived the first click as doing nothing.
+
+**Solution**: Always call `scrollToBottomInternal()` immediately for visual feedback. Then, if there's a newer gap, expand toward it asynchronously. `pendingScrollToBottomRef` ensures we snap to the true bottom when expansion completes.
+
+## File Structure
+
+```
+src/components/chat/
+  ChatVirtualScroll.tsx         - Main component, state machine, scroll handling
+  ChatVirtualScroll.module.scss - Styles
+  useChatRows.ts                - MessageResponse[] -> ChatRow[] transformation
+
+src/components/chat/virtualScroll/
+  types.ts          - All type definitions and constants
+  heightCache.ts    - Persistent height cache (never pruned)
+  MeasuredRow.tsx   - Row wrapper with ResizeObserver + useLayoutEffect registration
+  useCoreManager.ts - Core range: expand, prune, reset, height queries
+  useMountedWindow.ts - Mounted window within core
+  useStagingBatch.ts  - Hidden batch lifecycle: queue -> measure -> commit
+```
+
+## Layout Structure (top to bottom in DOM)
+
+```
+[header (optional)]
+[network-loading spinner (if loading older from server)]
+[top-boundary: ~60px spinner if core doesn't reach start of rows]
+[top-spacer: exact sum of measured heights for core rows above mounted window]
+[mounted rows: actual DOM nodes with ResizeObserver]
+[bottom-spacer: exact sum of measured heights for core rows below mounted window]
+[bottom-boundary: ~60px spinner if core doesn't reach end of rows]
+[bottom padding]
+[staging area: position:absolute, visibility:hidden — for pre-measurement]
+```
+
+## Invariants
+
+1. **Only measured heights in scroll geometry** — no estimates contribute to spacer heights or scroll range
+2. **Stable row keys are the source of truth** — mutation classification, index adjustment, and height caching all key off `msg:` prefixed keys
+3. **Prepend preservation happens before paint** — index shifting in render phase, scroll adjustment in `useLayoutEffect`
+4. **No scrollTop adjustments during active scrolling** — all core expansion deferred to scroll idle
+5. **Network loading is parent policy** — virtualizer reports geometry, `chat-thread.tsx` decides when to fetch
+6. **Height cache persists** — measurement work is never discarded, only the core range is bounded
+7. **Optimistic confirmation must not remount a row** — `client_generated_id` is stable across confirmation
