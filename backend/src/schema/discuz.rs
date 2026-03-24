@@ -75,6 +75,5 @@ pub mod discuz {
             maxinviteday -> Int4,
         }
     }
-
     diesel::allow_tables_to_appear_in_same_query!(common_member, common_usergroup,);
 }

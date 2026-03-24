@@ -392,6 +392,7 @@ fn build_sender(
         uid,
         avatar_url: user_avatars.get(&uid).cloned().flatten(),
         name: profile.and_then(|profile| profile.username.clone()),
+        gender: profile.map(|profile| profile.gender).unwrap_or(0),
         user_group: profile.and_then(|profile| profile.user_group.clone()),
     }
 }

@@ -25,6 +25,7 @@ export interface MemberResponse {
   joined_at: string;
   username: string | null;
   avatar_url: string | null;
+  gender: number;
   user_group?: UserGroupInfo | null;
 }
 

@@ -4,6 +4,7 @@ export interface User {
   uid: number;
   username: string;
   avatar_url?: string | null;
+  gender: number;
 }
 
 export const usersApi = {

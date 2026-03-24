@@ -3,10 +3,9 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
-use diesel::prelude::*;
 use serde::Serialize;
 
-use crate::services::user::lookup_user_avatars;
+use crate::services::user::{lookup_user_avatars, lookup_user_profiles};
 use crate::utils::auth::{
     encode_auth_token, extract_auth_context, required_client_id, AuthClaims, AuthSource, CurrentUid,
 };
@@ -17,6 +16,7 @@ pub struct MeResponse {
     pub uid: i32,
     pub username: String,
     pub avatar_url: Option<String>,
+    pub gender: i16,
 }
 
 #[derive(Serialize)]
@@ -29,8 +29,6 @@ async fn get_me(
     CurrentUid(uid): CurrentUid,
     State(state): State<AppState>,
 ) -> Result<Json<MeResponse>, (StatusCode, &'static str)> {
-    use crate::schema::discuz::discuz::common_member::dsl as cm_dsl;
-
     let conn = &mut state.db.get().map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -38,15 +36,13 @@ async fn get_me(
         )
     })?;
 
-    let username = cm_dsl::common_member
-        .filter(cm_dsl::uid.eq(uid))
-        .select(cm_dsl::username)
-        .first::<String>(conn)
-        .optional()
-        .map_err(|e| {
-            tracing::error!("get me username: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, "Database error")
-        })?
+    let profiles = lookup_user_profiles(conn, &[uid]).map_err(|e| {
+        tracing::error!("get me profile: {:?}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Database error")
+    })?;
+    let profile = profiles.get(&uid);
+    let username = profile
+        .and_then(|profile| profile.username.clone())
         .unwrap_or_else(|| "Unknown".to_string());
 
     let mut avatars = lookup_user_avatars(&state, &[uid]);
@@ -56,6 +52,7 @@ async fn get_me(
         uid,
         username,
         avatar_url,
+        gender: profile.map(|profile| profile.gender).unwrap_or(0),
     }))
 }
 

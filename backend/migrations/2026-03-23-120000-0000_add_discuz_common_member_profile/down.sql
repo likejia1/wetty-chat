@@ -1,0 +1,1 @@
+-- Nothing to do here, up is idempotent and targets shared Discuz schema objects.

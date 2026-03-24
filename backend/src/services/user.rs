@@ -10,6 +10,7 @@ use std::time::UNIX_EPOCH;
 #[derive(Debug, Clone)]
 pub struct UserProfile {
     pub username: Option<String>,
+    pub gender: i16,
     pub user_group: Option<UserGroupInfo>,
 }
 
@@ -133,6 +134,7 @@ pub fn lookup_user_profiles(
 ) -> QueryResult<HashMap<i32, UserProfile>> {
     use crate::schema::discuz::discuz::common_member::dsl as cm_dsl;
     use crate::schema::discuz::discuz::common_usergroup::dsl as cug_dsl;
+    use crate::schema::discuz_manual::discuz::common_member_profile::dsl as cmp_dsl;
     use crate::schema::usergroup_extra::dsl as uge_dsl;
 
     if uids.is_empty() {
@@ -142,17 +144,20 @@ pub fn lookup_user_profiles(
     let rows: Vec<(
         i32,
         String,
+        Option<i16>,
         i32,
         Option<String>,
         Option<String>,
         Option<String>,
     )> = cm_dsl::common_member
+        .left_join(cmp_dsl::common_member_profile.on(cm_dsl::uid.eq(cmp_dsl::uid)))
         .left_join(cug_dsl::common_usergroup.on(cm_dsl::groupid.eq(cug_dsl::groupid)))
         .left_join(uge_dsl::usergroup_extra.on(cm_dsl::groupid.eq(uge_dsl::groupid)))
         .filter(cm_dsl::uid.eq_any(uids))
         .select((
             cm_dsl::uid,
             cm_dsl::username,
+            cmp_dsl::gender.nullable(),
             cm_dsl::groupid,
             cug_dsl::grouptitle.nullable(),
             uge_dsl::chat_group_color.nullable(),
@@ -163,11 +168,20 @@ pub fn lookup_user_profiles(
     Ok(rows
         .into_iter()
         .map(
-            |(uid, username, group_id, group_name, chat_group_color, chat_group_color_dark)| {
+            |(
+                uid,
+                username,
+                gender,
+                group_id,
+                group_name,
+                chat_group_color,
+                chat_group_color_dark,
+            )| {
                 (
                     uid,
                     UserProfile {
                         username: Some(username),
+                        gender: gender.unwrap_or(0),
                         user_group: Some(UserGroupInfo {
                             group_id,
                             name: group_name,

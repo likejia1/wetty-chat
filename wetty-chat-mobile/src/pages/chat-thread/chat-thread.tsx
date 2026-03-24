@@ -737,7 +737,7 @@ function ChatThreadCore({ chatId, threadId, backAction }: ChatThreadCoreProps) {
                 )}
                 <ChatBubble
                   senderName={msg.sender.name ?? `User ${msg.sender.uid}`}
-                  senderGender={0}
+                  senderGender={msg.sender.gender}
                   senderGroup={msg.sender.user_group}
                   message={msg.is_deleted ? t`[Deleted]` : (msg.message ?? '')}
                   isSent={msg.sender.uid === currentUserId}

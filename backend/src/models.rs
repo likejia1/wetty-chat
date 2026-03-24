@@ -42,6 +42,7 @@ pub struct Sender {
     pub uid: i32,
     pub avatar_url: Option<String>,
     pub name: Option<String>,
+    pub gender: i16,
     pub user_group: Option<UserGroupInfo>,
 }
 

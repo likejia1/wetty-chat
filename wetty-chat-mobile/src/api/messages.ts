@@ -12,6 +12,7 @@ export interface Sender {
   uid: number;
   avatar_url?: string;
   name: string | null;
+  gender: number;
   user_group?: UserGroupInfo | null;
 }
 

@@ -47,6 +47,7 @@ pub struct MemberResponse {
     joined_at: DateTime<Utc>,
     username: Option<String>,
     avatar_url: Option<String>,
+    gender: i16,
     user_group: Option<UserGroupInfo>,
 }
 
@@ -90,6 +91,7 @@ fn build_member_responses(
                 role,
                 joined_at,
                 username: profile.and_then(|profile| profile.username.clone()),
+                gender: profile.map(|profile| profile.gender).unwrap_or(0),
                 user_group: profile.and_then(|profile| profile.user_group.clone()),
             }
         })
@@ -307,6 +309,7 @@ async fn post_add_member(
             joined_at: now,
             username: profile.and_then(|profile| profile.username.clone()),
             avatar_url,
+            gender: profile.map(|profile| profile.gender).unwrap_or(0),
             user_group: profile.and_then(|profile| profile.user_group.clone()),
         }),
     ))
@@ -443,6 +446,7 @@ async fn patch_member(
         joined_at,
         username: profile.and_then(|profile| profile.username.clone()),
         avatar_url,
+        gender: profile.map(|profile| profile.gender).unwrap_or(0),
         user_group: profile.and_then(|profile| profile.user_group.clone()),
     }))
 }
