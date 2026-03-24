@@ -10,11 +10,26 @@
   width: 100%;
 }
 
-.item {
+.flowContent {
+  position: relative;
+  width: 100%;
+  min-height: 100%;
+}
+
+.flowItem {
+  width: 100%;
+}
+
+.stagingArea {
   position: absolute;
-  left: 0;
-  right: 0;
-  will-change: transform;
+  inset: 0;
+  pointer-events: none;
+  visibility: hidden;
+  z-index: -1;
+}
+
+.stagingItem {
+  width: 100%;
 }
 
 .loadingRow {

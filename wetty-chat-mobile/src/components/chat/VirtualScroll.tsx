@@ -1,423 +1,721 @@
-import { type ReactNode, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import {
+  type MutableRefObject,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+import { flushSync } from 'react-dom';
 import styles from './VirtualScroll.module.scss';
-import { FenwickTree } from './virtualScroll/fenwick';
 
-interface VirtualScrollProps {
-  totalItems: number;
-  estimatedItemHeight: number;
-  renderItem: (index: number) => ReactNode;
-  overscan?: number;
-  onLoadOlder?: () => void;
-  onLoadNewer?: () => void;
-  loadMoreThreshold?: number;
-  loadingOlder?: boolean;
-  prependedCount?: number;
-  scrollToBottomRef?: React.MutableRefObject<(() => void) | null>;
-  scrollToIndexRef?: React.MutableRefObject<((index: number, behavior?: ScrollBehavior) => void) | null>;
+/*
+Design criteria for the chat scroller:
+
+1. Visible geometry must be derived only from committed, measured rows.
+   Unmeasured rows may exist in the logical data set and in the hidden staging area,
+   but they must not participate in visible offsets or scroll preservation until a
+   whole batch has been measured and committed.
+
+2. Prepend, append, and reset must be classified from stable row keys in the same
+   render as the data change.
+   A separate side channel such as prepended counts is too late and causes one bad
+   commit where the scroller loses its frontier or applies the wrong scroll logic.
+
+3. Any content inserted above the viewport must preserve the current viewport position
+   in the same layout cycle.
+   We do this with flow-height deltas instead of estimate-to-real correction or
+   post-paint scroll repair.
+
+4. Initial reveal must wait for a real viewport height and a measured committed range.
+   Default open is anchored to the bottom of committed content.
+   Jump-to-message bootstraps around a stable row key, not an array index.
+
+5. Row identity must stay stable across optimistic confirmation.
+   The scroller uses client_generated_id-or-id keys, so confirmation must not remount
+   the row and disturb measurement or scroll state.
+*/
+
+export interface VirtualScrollHandle {
+  scrollToBottom: () => void;
+  scrollToItem: (key: string, behavior?: ScrollBehavior) => void;
+}
+
+export type VirtualScrollAnchor =
+  | { type: 'bottom'; token: number }
+  | { type: 'item'; key: string; token: number };
+
+interface LoadController {
+  hasMore: boolean;
+  loading?: boolean;
+  onLoad: () => void;
+}
+
+interface VirtualScrollProps<T> {
+  items: T[];
+  getItemKey: (item: T, index: number) => string;
+  renderItem: (item: T, index: number) => ReactNode;
+  initialAnchor: VirtualScrollAnchor;
+  loadOlder: LoadController;
+  loadNewer?: LoadController;
+  scrollApiRef?: MutableRefObject<VirtualScrollHandle | null>;
   bottomPadding?: number;
-  windowKey?: number | string;
-  initialScrollIndex?: number;
   onAtBottomChange?: (atBottom: boolean) => void;
   onScrollIdle?: () => void;
   header?: ReactNode;
 }
 
-function MeasuredItem({
-  index,
-  offset,
-  onResize,
+type Phase = 'WAITING_VIEWPORT' | 'BOOTSTRAP' | 'READY';
+type BatchDirection = 'backward' | 'forward';
+type MutationType = 'none' | 'prepend' | 'append' | 'reset';
+
+interface Frontier {
+  startKey: string | null;
+  endKey: string | null;
+}
+
+interface FrontierIndices {
+  start: number;
+  end: number;
+}
+
+interface PendingBatch {
+  direction: BatchDirection;
+  keys: string[];
+}
+
+interface PendingLayoutAction {
+  preserveHeightDelta?: boolean;
+  scrollToBottom?: boolean;
+  scrollToKey?: { key: string; behavior?: ScrollBehavior };
+}
+
+interface LayoutSnapshot {
+  flowHeight: number;
+  scrollTop: number;
+  topChromeHeight: number;
+  keys: string[];
+}
+
+function isFrontierEmpty(frontier: Frontier): boolean {
+  return frontier.startKey == null || frontier.endKey == null;
+}
+
+function arraysEqual(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function isPrefix(prefix: string[], full: string[]): boolean {
+  return prefix.every((value, index) => full[index] === value);
+}
+
+function isSuffix(suffix: string[], full: string[]): boolean {
+  const offset = full.length - suffix.length;
+  return suffix.every((value, index) => full[offset + index] === value);
+}
+
+function classifyKeyMutation(previous: string[], next: string[]): MutationType {
+  if (arraysEqual(previous, next)) return 'none';
+  if (previous.length === 0 || next.length === 0 || next.length < previous.length) return 'reset';
+  if (isSuffix(previous, next)) return 'prepend';
+  if (isPrefix(previous, next)) return 'append';
+  return 'reset';
+}
+
+function MeasuredRow({
+  itemKey,
+  hidden = false,
+  onMeasure,
+  registerRow,
   children,
-  invisible = false,
 }: {
-  index: number;
-  offset: number;
-  onResize: (index: number, height: number) => void;
+  itemKey: string;
+  hidden?: boolean;
+  onMeasure: (itemKey: string, height: number) => void;
+  registerRow?: (itemKey: string, node: HTMLDivElement | null) => void;
   children: ReactNode;
-  invisible?: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
+    const node = ref.current;
+    if (!node) return;
+
+    registerRow?.(itemKey, node);
+
     const ro = new ResizeObserver(() => {
-      const h = el.getBoundingClientRect().height;
-      if (h > 0) onResize(index, h);
+      const height = node.getBoundingClientRect().height;
+      if (height > 0) {
+        onMeasure(itemKey, height);
+      }
     });
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, [index, onResize]);
+
+    ro.observe(node);
+
+    return () => {
+      registerRow?.(itemKey, null);
+      ro.disconnect();
+    };
+  }, [itemKey, onMeasure, registerRow]);
 
   return (
     <div
       ref={ref}
-      className={styles.item}
-      style={{
-        transform: invisible ? `translateY(0px)` : `translateY(${Math.round(offset)}px)`,
-        visibility: invisible ? 'hidden' : 'visible',
-        pointerEvents: invisible ? 'none' : 'auto',
-        zIndex: invisible ? -1 : undefined,
-      }}
+      className={hidden ? styles.stagingItem : styles.flowItem}
+      aria-hidden={hidden || undefined}
     >
       {children}
     </div>
   );
 }
 
-export function VirtualScroll({
-  totalItems,
-  estimatedItemHeight,
+const BOOTSTRAP_HEIGHT_MULTIPLIER = 2;
+const MAX_BATCH_ITEMS = 20;
+const FRONTIER_THRESHOLD_PX = 320;
+const FRONTIER_SPINNER_HEIGHT = 40;
+
+export function VirtualScroll<T>({
+  items,
+  getItemKey,
   renderItem,
-  overscan = 5,
-  onLoadOlder,
-  onLoadNewer,
-  loadMoreThreshold = 500,
-  loadingOlder = false,
-  prependedCount = 0,
-  scrollToBottomRef,
-  scrollToIndexRef,
+  initialAnchor,
+  loadOlder,
+  loadNewer,
+  scrollApiRef,
   bottomPadding = 0,
-  windowKey,
-  initialScrollIndex,
   onAtBottomChange,
   onScrollIdle,
   header,
-}: VirtualScrollProps) {
+}: VirtualScrollProps<T>) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const spacerRef = useRef<HTMLDivElement>(null);
+  const flowContentRef = useRef<HTMLDivElement>(null);
   const headerRef = useRef<HTMLDivElement>(null);
+  const rowRefs = useRef(new Map<string, HTMLDivElement>());
+  const heightCacheRef = useRef(new Map<string, number>());
+  const pendingMeasurementsRef = useRef(new Map<string, number>());
+  const pendingBatchRef = useRef<PendingBatch | null>(null);
+  const pendingLayoutActionRef = useRef<PendingLayoutAction | null>(null);
+  const pendingScrollKeyRef = useRef<string | null>(null);
+  const pendingScrollBehaviorRef = useRef<ScrollBehavior>('auto');
+  const pendingScrollToBottomRef = useRef(false);
   const scrollIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrollRafRef = useRef<number | null>(null);
   const pendingScrollTopRef = useRef(0);
-  const isScrollIdleRef = useRef(true);
-  const containerHeightRef = useRef(0);
-  const [headerHeight, setHeaderHeight] = useState(0);
+  const isAtBottomRef = useRef(true);
+  const phaseRef = useRef<Phase>('WAITING_VIEWPORT');
+  const frontierRef = useRef<Frontier>({ startKey: null, endKey: null });
+  const initialAnchorRef = useRef(initialAnchor);
+  const keyToIndexRef = useRef<Map<string, number>>(new Map());
+  const itemKeysRef = useRef<string[]>([]);
+  const frontierIndicesRef = useRef<FrontierIndices | null>(null);
+  const prevKeysRef = useRef<string[]>([]);
+  const layoutSnapshotRef = useRef<LayoutSnapshot | null>(null);
 
-  useEffect(() => {
-    const el = headerRef.current;
-    if (!el) {
-      setHeaderHeight(0);
+  const [phase, setPhase] = useState<Phase>('WAITING_VIEWPORT');
+  const [frontier, setFrontier] = useState<Frontier>({ startKey: null, endKey: null });
+  const [pendingBatch, setPendingBatch] = useState<PendingBatch | null>(null);
+  const [containerHeight, setContainerHeight] = useState(0);
+  const [headerHeight, setHeaderHeight] = useState(0);
+  const [, setScrollTop] = useState(0);
+
+  const itemKeys = useMemo(() => items.map((item, index) => getItemKey(item, index)), [getItemKey, items]);
+
+  const keyToIndex = useMemo(() => {
+    const map = new Map<string, number>();
+    itemKeys.forEach((itemKey, index) => map.set(itemKey, index));
+    return map;
+  }, [itemKeys]);
+
+  const frontierIndices = useMemo(() => {
+    if (isFrontierEmpty(frontier)) return null;
+
+    const start = keyToIndex.get(frontier.startKey);
+    const end = keyToIndex.get(frontier.endKey);
+    if (start == null || end == null || start > end) return null;
+
+    return { start, end };
+  }, [frontier, keyToIndex]);
+
+  keyToIndexRef.current = keyToIndex;
+  itemKeysRef.current = itemKeys;
+  frontierIndicesRef.current = frontierIndices;
+  initialAnchorRef.current = initialAnchor;
+
+  const loadingRowHeight = 36;
+
+  const setPhaseState = useCallback((next: Phase) => {
+    phaseRef.current = next;
+    setPhase(next);
+  }, []);
+
+  const setFrontierState = useCallback((next: Frontier) => {
+    frontierRef.current = next;
+    setFrontier(next);
+  }, []);
+
+  const getViewportHeight = useCallback(() => containerRef.current?.clientHeight || containerHeight || 0, [containerHeight]);
+
+  const getBootstrapTargetHeight = useCallback(
+    () => Math.ceil(getViewportHeight() * BOOTSTRAP_HEIGHT_MULTIPLIER),
+    [getViewportHeight],
+  );
+
+  const getRangeHeight = useCallback((range = frontierIndicesRef.current, keys = itemKeysRef.current) => {
+    if (!range) return 0;
+
+    let total = 0;
+    for (let index = range.start; index <= range.end; index++) {
+      total += heightCacheRef.current.get(keys[index]) ?? 0;
+    }
+    return total;
+  }, []);
+
+  const hasOlderGap = useCallback((range = frontierIndicesRef.current) => (range ? range.start > 0 : itemKeysRef.current.length > 0), []);
+  const hasNewerGap = useCallback((range = frontierIndicesRef.current) => (range ? range.end < itemKeysRef.current.length - 1 : itemKeysRef.current.length > 0), []);
+
+  const topSpinnerHeight = phase === 'READY' && hasOlderGap(frontierIndices) ? FRONTIER_SPINNER_HEIGHT : 0;
+  const bottomSpinnerHeight = phase === 'READY' && hasNewerGap(frontierIndices) ? FRONTIER_SPINNER_HEIGHT : 0;
+  const topChromeHeight = headerHeight + (loadOlder.loading ? loadingRowHeight : 0) + topSpinnerHeight;
+
+  const clampScrollTop = useCallback(
+    (value: number) => {
+      const container = containerRef.current;
+      const viewportHeight = container?.clientHeight || containerHeight || 0;
+      const scrollHeight = container?.scrollHeight || 0;
+      const max = Math.max(0, scrollHeight - viewportHeight);
+      return Math.min(Math.max(0, value), max);
+    },
+    [containerHeight],
+  );
+
+  const registerRow = useCallback((itemKey: string, node: HTMLDivElement | null) => {
+    if (node) {
+      rowRefs.current.set(itemKey, node);
+    } else {
+      rowRefs.current.delete(itemKey);
+    }
+  }, []);
+
+  const createBatch = useCallback(
+    (direction: BatchDirection, range = frontierIndicesRef.current): PendingBatch | null => {
+      const keys = itemKeysRef.current;
+      if (keys.length === 0) return null;
+
+      if (!range) {
+        const anchor = initialAnchorRef.current;
+        const anchorIndex = anchor.type === 'item' ? (keyToIndexRef.current.get(anchor.key) ?? (keys.length - 1)) : (keys.length - 1);
+        const start = Math.max(0, anchorIndex - (MAX_BATCH_ITEMS - 1));
+        const batchKeys = keys.slice(start, anchorIndex + 1);
+        return batchKeys.length > 0 ? { direction: 'backward', keys: batchKeys } : null;
+      }
+
+      if (direction === 'backward') {
+        if (range.start <= 0) return null;
+        const start = Math.max(0, range.start - MAX_BATCH_ITEMS);
+        const batchKeys = keys.slice(start, range.start);
+        return batchKeys.length > 0 ? { direction, keys: batchKeys } : null;
+      }
+
+      if (range.end >= keys.length - 1) return null;
+      const end = Math.min(keys.length - 1, range.end + MAX_BATCH_ITEMS);
+      const batchKeys = keys.slice(range.end + 1, end + 1);
+      return batchKeys.length > 0 ? { direction, keys: batchKeys } : null;
+    },
+    [],
+  );
+
+  const queueBatch = useCallback((batch: PendingBatch | null) => {
+    if (!batch || batch.keys.length === 0 || pendingBatchRef.current) return false;
+    pendingMeasurementsRef.current = new Map();
+    pendingBatchRef.current = batch;
+    setPendingBatch(batch);
+    return true;
+  }, []);
+
+  const maybeQueueBootstrap = useCallback(() => {
+    if (phaseRef.current !== 'BOOTSTRAP' || pendingBatchRef.current || getViewportHeight() <= 0) return;
+
+    const currentRange = frontierIndicesRef.current;
+    if (!currentRange) {
+      queueBatch(createBatch('backward', currentRange));
       return;
     }
-    const ro = new ResizeObserver(() => {
-      const h = el.getBoundingClientRect().height;
-      if (h > 0) setHeaderHeight(h);
-    });
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, [header]);
 
-  const [scrollTop, setScrollTop] = useState(0);
-  const [containerHeight, setContainerHeight] = useState(0);
-  const prevTotalRef = useRef(totalItems);
-  const prevPrependedCountRef = useRef(prependedCount);
-  const heightCache = useRef(new Map<number, number>());
-  const heightTreeRef = useRef<FenwickTree>(new FenwickTree(totalItems, estimatedItemHeight));
-  const isAtBottomRef = useRef(true);
-  const prevLoadingOlderRef = useRef(loadingOlder);
-  const initialScrollIndexRef = useRef<number | undefined>(undefined);
-  const batchTimerRef = useRef<number | null>(null);
-  const [, forceUpdate] = useState(0);
+    if (getRangeHeight(currentRange) >= getBootstrapTargetHeight()) return;
 
-  const rebuildHeightTree = useCallback(
-    (cache = heightCache.current) => {
-      const tree = new FenwickTree(totalItems, estimatedItemHeight);
-      for (const [index, height] of cache.entries()) {
-        if (index >= 0 && index < totalItems) {
-          tree.set(index, height);
-        }
-      }
-      heightTreeRef.current = tree;
+    queueBatch(createBatch(currentRange.start > 0 ? 'backward' : 'forward', currentRange));
+  }, [createBatch, getBootstrapTargetHeight, getRangeHeight, getViewportHeight, queueBatch]);
+
+  const maybeQueueFrontier = useCallback(
+    (direction: BatchDirection) => {
+      if (phaseRef.current !== 'READY' || pendingBatchRef.current) return;
+      queueBatch(createBatch(direction));
     },
-    [estimatedItemHeight, totalItems],
+    [createBatch, queueBatch],
   );
 
-  // Phase state machine: MEASURING → READY
-  const [phase, setPhase] = useState<'MEASURING' | 'READY'>('MEASURING');
-  const phaseRef = useRef<'MEASURING' | 'READY'>('MEASURING');
-  const safetyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const scrollToBottomInternal = useCallback(() => {
+    const container = containerRef.current;
+    if (!container) return;
 
-  const getHeight = useCallback(
-    (i: number) => {
-      return heightTreeRef.current.get(i) || estimatedItemHeight;
+    container.scrollTop = clampScrollTop(container.scrollHeight);
+    setScrollTop(container.scrollTop);
+  }, [clampScrollTop]);
+
+  const scrollToKeyInternal = useCallback(
+    (itemKey: string, behavior: ScrollBehavior = 'auto') => {
+      const container = containerRef.current;
+      const row = rowRefs.current.get(itemKey);
+      if (!container || !row) return;
+
+      const target = clampScrollTop(row.offsetTop);
+      container.scrollTo({ top: target, behavior });
+      setScrollTop(target);
     },
-    [estimatedItemHeight],
+    [clampScrollTop],
   );
 
-  const getItemOffset = useCallback((index: number) => {
-    return heightTreeRef.current.prefixSum(index);
-  }, []);
+  const updateAtBottom = useCallback(() => {
+    const container = containerRef.current;
+    if (!container) return;
 
-  const getTotalHeight = useCallback(() => {
-    return heightTreeRef.current.total();
-  }, []);
-
-  // Binary search: find the first index whose bottom edge is past scrollTop
-  const findStartIndex = useCallback((scrollTop: number) => {
-    return heightTreeRef.current.findIndexByOffset(scrollTop);
-  }, []);
-
-  const totalHeight = getTotalHeight();
-
-  // transitionToReady: the critical MEASURING → READY transition
-  const transitionToReady = useCallback(() => {
-    const el = containerRef.current;
-    const spacer = spacerRef.current;
-    if (!el || !spacer) return;
-    if (phaseRef.current === 'READY') return;
-
-    // Clear safety timeout
-    if (safetyTimeoutRef.current) {
-      clearTimeout(safetyTimeoutRef.current);
-      safetyTimeoutRef.current = null;
+    const atBottom = !hasNewerGap() && container.scrollHeight - (container.scrollTop + container.clientHeight) <= 30;
+    if (atBottom !== isAtBottomRef.current) {
+      isAtBottomRef.current = atBottom;
+      onAtBottomChange?.(atBottom);
     }
+  }, [hasNewerGap, onAtBottomChange]);
 
-    // Compute real totalHeight from fully-populated heightCache
-    let realTotal = 0;
-    for (let i = 0; i < totalItems; i++) {
-      realTotal += heightCache.current.get(i) ?? estimatedItemHeight;
-    }
+  const commitBatch = useCallback(
+    (batch: PendingBatch) => {
+      if (!batch.keys.every((itemKey) => pendingMeasurementsRef.current.has(itemKey))) return;
 
-    const currentTopPadding = (loadingOlder ? 36 : 0) + headerHeight;
-    // Set spacer DOM height directly before React re-renders
-    spacer.style.height = `${realTotal + currentTopPadding + bottomPadding}px`;
-
-    // Set scroll position
-    const targetIdx = initialScrollIndexRef.current;
-    if (targetIdx != null) {
-      const offset = getItemOffset(targetIdx) + currentTopPadding;
-      el.scrollTop = Math.max(0, offset - el.clientHeight / 2);
-      if (heightCache.current.has(targetIdx)) {
-        initialScrollIndexRef.current = undefined;
+      for (const itemKey of batch.keys) {
+        heightCacheRef.current.set(itemKey, pendingMeasurementsRef.current.get(itemKey) ?? 0);
       }
-    } else {
-      // Scroll to bottom
-      el.scrollTop = el.scrollHeight - el.clientHeight;
-      isAtBottomRef.current = true;
-    }
 
-    // Sync React state
-    setScrollTop(el.scrollTop);
-    containerHeightRef.current = el.clientHeight;
-    setContainerHeight(el.clientHeight);
+      const batchIndices = batch.keys
+        .map((itemKey) => keyToIndexRef.current.get(itemKey))
+        .filter((index): index is number => index != null);
 
-    // Transition phase
-    phaseRef.current = 'READY';
-    setPhase('READY');
-  }, [totalItems, estimatedItemHeight, loadingOlder, headerHeight, bottomPadding, getItemOffset]);
-
-  // Safety timeout: if MEASURING doesn't complete in 2s, transition anyway
-  useEffect(() => {
-    if (phase === 'MEASURING' && totalItems > 0) {
-      safetyTimeoutRef.current = setTimeout(() => {
-        if (phaseRef.current === 'MEASURING') {
-          transitionToReady();
-        }
-      }, 2000);
-      return () => {
-        if (safetyTimeoutRef.current) {
-          clearTimeout(safetyTimeoutRef.current);
-          safetyTimeoutRef.current = null;
-        }
-      };
-    }
-  }, [phase, totalItems, transitionToReady]);
-
-  // If totalItems is 0 during MEASURING, transition immediately
-  useEffect(() => {
-    if (phase === 'MEASURING' && totalItems === 0) {
-      phaseRef.current = 'READY';
-      setPhase('READY');
-    }
-  }, [phase, totalItems]);
-
-  // Snap to bottom or scroll-to-index when totalHeight changes (item resize, new content)
-  useLayoutEffect(() => {
-    if (phaseRef.current !== 'READY') return;
-    const el = containerRef.current;
-    if (!el) return;
-
-    const targetIdx = initialScrollIndexRef.current;
-    if (targetIdx != null) {
-      const currentTopPadding = (loadingOlder ? 36 : 0) + headerHeight;
-      const offset = getItemOffset(targetIdx) + currentTopPadding;
-      el.scrollTop = Math.max(0, offset - el.clientHeight / 2);
-      if (heightCache.current.has(targetIdx)) {
-        initialScrollIndexRef.current = undefined;
+      if (batchIndices.length === 0) {
+        pendingMeasurementsRef.current = new Map();
+        pendingBatchRef.current = null;
+        setPendingBatch(null);
+        return;
       }
-    } else if (isAtBottomRef.current) {
-      const target = el.scrollHeight - el.clientHeight;
-      if (Math.abs(el.scrollTop - target) > 1) {
-        el.scrollTop = target;
-      }
-    }
-  }, [totalHeight, loadingOlder, headerHeight, getItemOffset]);
 
-  // When items are prepended at top, adjust scrollTop to maintain position
-  useLayoutEffect(() => {
-    if (phaseRef.current !== 'READY') return;
-    const newPrepended = prependedCount - prevPrependedCountRef.current;
-    if (newPrepended > 0) {
-      if (heightCache.current.size > 0) {
-        const newCache = new Map<number, number>();
-        for (const [k, v] of heightCache.current.entries()) {
-          newCache.set(k + newPrepended, v);
-        }
-        heightCache.current = newCache;
-      }
-      rebuildHeightTree();
-      const el = containerRef.current;
-      if (el) {
-        el.scrollTop += heightTreeRef.current.prefixSum(newPrepended);
-      }
-    }
-    prevPrependedCountRef.current = prependedCount;
-
-    // Compensate for loading bar appearing/disappearing
-    if (prevLoadingOlderRef.current !== loadingOlder) {
-      const el = containerRef.current;
-      if (el) {
-        const delta = loadingOlder ? 36 : -36;
-        el.scrollTop += delta;
-      }
-      prevLoadingOlderRef.current = loadingOlder;
-    }
-  }, [prependedCount, loadingOlder, rebuildHeightTree]);
-
-  // Auto-scroll to bottom when new messages appended and user was at bottom
-  useLayoutEffect(() => {
-    if (phaseRef.current !== 'READY') return;
-    const prev = prevTotalRef.current;
-    if (isAtBottomRef.current && totalItems > prev) {
-      const el = containerRef.current;
-      if (el) {
-        requestAnimationFrame(() => {
-          el.scrollTop = el.scrollHeight - el.clientHeight;
-        });
-      }
-    }
-    prevTotalRef.current = totalItems;
-  }, [totalItems]);
-
-  // Reset state when windowKey changes (new message window loaded)
-  useEffect(() => {
-    if (windowKey == null) return;
-    heightCache.current = new Map();
-    rebuildHeightTree();
-    prevTotalRef.current = 0;
-    prevPrependedCountRef.current = 0;
-    if (initialScrollIndex != null) {
-      isAtBottomRef.current = false;
-      onAtBottomChange?.(false);
-      initialScrollIndexRef.current = initialScrollIndex;
-    } else {
-      isAtBottomRef.current = true;
-      onAtBottomChange?.(true);
-    }
-    // Reset to MEASURING phase
-    phaseRef.current = 'MEASURING';
-    setPhase('MEASURING');
-    forceUpdate((c) => c + 1);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [windowKey]);
-
-  useEffect(() => {
-    rebuildHeightTree();
-    forceUpdate((c) => c + 1);
-  }, [estimatedItemHeight, totalItems, rebuildHeightTree]);
-
-  // Expose scrollToBottom for imperative use
-  useEffect(() => {
-    if (scrollToBottomRef) {
-      scrollToBottomRef.current = () => {
-        const el = containerRef.current;
-        if (el) {
-          el.scrollTop = el.scrollHeight;
-          if (!isAtBottomRef.current) {
-            isAtBottomRef.current = true;
-            onAtBottomChange?.(true);
+      const currentRange = frontierIndicesRef.current;
+      const nextRange: FrontierIndices = currentRange
+        ? {
+            start: Math.min(currentRange.start, batchIndices[0]),
+            end: Math.max(currentRange.end, batchIndices[batchIndices.length - 1]),
           }
-        }
+        : { start: batchIndices[0], end: batchIndices[batchIndices.length - 1] };
+
+      const nextKeys = itemKeysRef.current;
+      const nextFrontier: Frontier = {
+        startKey: nextKeys[nextRange.start] ?? null,
+        endKey: nextKeys[nextRange.end] ?? null,
       };
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scrollToBottomRef]);
 
-  // Expose scrollToIndex for imperative use
-  useEffect(() => {
-    if (scrollToIndexRef) {
-      scrollToIndexRef.current = (index: number, behavior: ScrollBehavior = 'auto') => {
-        const el = containerRef.current;
-        if (!el) return;
-        const currentTopPadding = (loadingOlder ? 36 : 0) + headerHeight;
-        const offset = getItemOffset(index) + currentTopPadding;
+      const nextRangeHeight = getRangeHeight(nextRange, nextKeys);
+      const shouldReveal =
+        phaseRef.current === 'BOOTSTRAP' &&
+        (nextRangeHeight >= getBootstrapTargetHeight() || (nextRange.start === 0 && nextRange.end === nextKeys.length - 1));
 
-        const targetAtBottom = offset + el.clientHeight >= el.scrollHeight - 30;
-        if (isAtBottomRef.current !== targetAtBottom) {
-          isAtBottomRef.current = targetAtBottom;
-          onAtBottomChange?.(targetAtBottom);
+      const action: PendingLayoutAction = {};
+      if (phaseRef.current === 'READY' && batch.direction === 'backward' && currentRange) {
+        action.preserveHeightDelta = true;
+      }
+
+      if (pendingScrollKeyRef.current) {
+        const pendingIndex = keyToIndexRef.current.get(pendingScrollKeyRef.current);
+        if (pendingIndex != null && pendingIndex >= nextRange.start && pendingIndex <= nextRange.end) {
+          action.scrollToKey = {
+            key: pendingScrollKeyRef.current,
+            behavior: pendingScrollBehaviorRef.current,
+          };
         }
+      } else if (shouldReveal && initialAnchorRef.current.type === 'item') {
+        const anchorIndex = keyToIndexRef.current.get(initialAnchorRef.current.key);
+        if (anchorIndex != null && anchorIndex >= nextRange.start && anchorIndex <= nextRange.end) {
+          action.scrollToKey = { key: initialAnchorRef.current.key, behavior: 'auto' };
+        }
+      }
 
-        el.scrollTo({ top: offset, behavior });
-      };
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scrollToIndexRef, getItemOffset, loadingOlder, headerHeight]);
+      if (
+        (phaseRef.current === 'READY' && batch.direction === 'forward' && isAtBottomRef.current) ||
+        pendingScrollToBottomRef.current ||
+        (shouldReveal && initialAnchorRef.current.type === 'bottom')
+      ) {
+        action.scrollToBottom = true;
+      }
 
-  const handleResize = useCallback(
-    (index: number, height: number) => {
-      const prev = heightCache.current.get(index) ?? estimatedItemHeight;
-      const isFirstMeasure = !heightCache.current.has(index);
+      pendingMeasurementsRef.current = new Map();
+      pendingBatchRef.current = null;
+      pendingLayoutActionRef.current = action;
 
-      if (prev === height && !isFirstMeasure) return;
+      flushSync(() => {
+        setFrontierState(nextFrontier);
+        setPendingBatch(null);
+        if (shouldReveal) {
+          setPhaseState('READY');
+        }
+      });
 
-      heightCache.current.set(index, height);
-      heightTreeRef.current.set(index, height);
+      if (phaseRef.current === 'BOOTSTRAP' && !shouldReveal) {
+        maybeQueueBootstrap();
+      }
+    },
+    [getBootstrapTargetHeight, getRangeHeight, maybeQueueBootstrap, setFrontierState, setPhaseState],
+  );
 
-      if (phaseRef.current === 'MEASURING') {
-        // Check if all items measured
-        if (heightCache.current.size >= totalItems) {
-          transitionToReady();
+  const handleMeasure = useCallback(
+    (itemKey: string, height: number) => {
+      const pending = pendingBatchRef.current;
+      if (pending?.keys.includes(itemKey)) {
+        pendingMeasurementsRef.current.set(itemKey, height);
+        if (pending.keys.every((key) => pendingMeasurementsRef.current.has(key))) {
+          commitBatch(pending);
         }
         return;
       }
 
-      // READY phase: batched forceUpdate + scroll adjustment
-      if (batchTimerRef.current == null) {
-        batchTimerRef.current = requestAnimationFrame(() => {
-          batchTimerRef.current = null;
-          forceUpdate((c) => c + 1);
-        });
-      }
+      const previous = heightCacheRef.current.get(itemKey);
+      if (previous == null || previous === height) return;
+      heightCacheRef.current.set(itemKey, height);
 
-      const el = containerRef.current;
-      if (el && isAtBottomRef.current) {
-        // If at bottom, snap to bottom after item resize
-        el.scrollTop = el.scrollHeight - el.clientHeight;
-      } else if (el && !isAtBottomRef.current) {
-        // For items above viewport when NOT at bottom, adjust scrollTop to maintain position
-        const diff = height - prev;
-        const currentTopPadding = (loadingOlder ? 36 : 0) + headerHeight;
-        const itemOffset = getItemOffset(index) + currentTopPadding;
+      const container = containerRef.current;
+      const row = rowRefs.current.get(itemKey);
+      if (!container || !row) return;
 
-        if (itemOffset < el.scrollTop) {
-          el.scrollTop += diff;
-          setScrollTop(el.scrollTop);
-        }
+      if (isAtBottomRef.current) {
+        scrollToBottomInternal();
+      } else if (row.offsetTop < container.scrollTop) {
+        container.scrollTop = clampScrollTop(container.scrollTop + (height - previous));
+        setScrollTop(container.scrollTop);
       }
     },
-    [getItemOffset, estimatedItemHeight, loadingOlder, headerHeight, totalItems, transitionToReady],
+    [clampScrollTop, commitBatch, scrollToBottomInternal],
   );
+
+  useLayoutEffect(() => {
+    const container = containerRef.current;
+    const flow = flowContentRef.current;
+    if (!container || !flow) return;
+
+    const previous = layoutSnapshotRef.current;
+    const action = pendingLayoutActionRef.current;
+    const mutation = classifyKeyMutation(prevKeysRef.current, itemKeys);
+    const topChromeChanged = previous != null && previous.topChromeHeight !== topChromeHeight;
+
+    if (
+      previous &&
+      phaseRef.current === 'READY' &&
+      !action?.scrollToBottom &&
+      (action?.preserveHeightDelta || mutation === 'prepend' || topChromeChanged)
+    ) {
+      const nextHeight = flow.scrollHeight;
+      container.scrollTop = clampScrollTop(previous.scrollTop + (nextHeight - previous.flowHeight));
+    }
+
+    if (action?.scrollToBottom) {
+      scrollToBottomInternal();
+      pendingScrollToBottomRef.current = false;
+    }
+
+    if (action?.scrollToKey) {
+      scrollToKeyInternal(action.scrollToKey.key, action.scrollToKey.behavior);
+      if (pendingScrollKeyRef.current === action.scrollToKey.key) {
+        pendingScrollKeyRef.current = null;
+      }
+    }
+
+    if (phaseRef.current === 'READY' && mutation === 'append' && isAtBottomRef.current && !action?.scrollToKey) {
+      pendingScrollToBottomRef.current = true;
+      if (hasNewerGap(frontierIndicesRef.current)) {
+        maybeQueueFrontier('forward');
+      } else {
+        scrollToBottomInternal();
+        pendingScrollToBottomRef.current = false;
+      }
+    }
+
+    setScrollTop(container.scrollTop);
+    updateAtBottom();
+    pendingLayoutActionRef.current = null;
+    layoutSnapshotRef.current = {
+      flowHeight: flow.scrollHeight,
+      scrollTop: container.scrollTop,
+      topChromeHeight,
+      keys: itemKeys,
+    };
+    prevKeysRef.current = itemKeys;
+  }, [
+    clampScrollTop,
+    hasNewerGap,
+    itemKeys,
+    maybeQueueFrontier,
+    scrollToBottomInternal,
+    scrollToKeyInternal,
+    topChromeHeight,
+    updateAtBottom,
+  ]);
+
+  useEffect(() => {
+    const headerNode = headerRef.current;
+    if (!headerNode) {
+      setHeaderHeight(0);
+      return;
+    }
+
+    const ro = new ResizeObserver(() => {
+      setHeaderHeight(headerNode.getBoundingClientRect().height);
+    });
+
+    ro.observe(headerNode);
+    return () => ro.disconnect();
+  }, [header]);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    let previousHeight = container.clientHeight;
+    const ro = new ResizeObserver(() => {
+      const nextHeight = container.clientHeight;
+      if (nextHeight === previousHeight) return;
+      previousHeight = nextHeight;
+      setContainerHeight(nextHeight);
+
+      if (phaseRef.current === 'WAITING_VIEWPORT' && nextHeight > 0) {
+        setPhaseState('BOOTSTRAP');
+      }
+    });
+
+    setContainerHeight(previousHeight);
+    if (phaseRef.current === 'WAITING_VIEWPORT' && previousHeight > 0) {
+      setPhaseState('BOOTSTRAP');
+    }
+
+    ro.observe(container);
+    return () => ro.disconnect();
+  }, [setPhaseState]);
+
+  useEffect(() => {
+    const anchor = initialAnchorRef.current;
+
+    rowRefs.current.clear();
+    heightCacheRef.current = new Map();
+    pendingMeasurementsRef.current = new Map();
+    pendingBatchRef.current = null;
+    pendingLayoutActionRef.current = null;
+    pendingScrollKeyRef.current = null;
+    pendingScrollBehaviorRef.current = 'auto';
+    pendingScrollToBottomRef.current = false;
+    layoutSnapshotRef.current = null;
+    prevKeysRef.current = itemKeysRef.current;
+
+    flushSync(() => {
+      setPendingBatch(null);
+      setFrontierState({ startKey: null, endKey: null });
+      setPhaseState(getViewportHeight() > 0 ? 'BOOTSTRAP' : 'WAITING_VIEWPORT');
+      setScrollTop(0);
+    });
+
+    isAtBottomRef.current = anchor.type === 'bottom';
+    onAtBottomChange?.(anchor.type === 'bottom');
+  }, [getViewportHeight, initialAnchor.token, onAtBottomChange, setFrontierState, setPhaseState]);
+
+  useEffect(() => {
+    if (phase === 'BOOTSTRAP') {
+      maybeQueueBootstrap();
+    }
+  }, [containerHeight, frontier.endKey, frontier.startKey, maybeQueueBootstrap, phase]);
+
+  useEffect(() => {
+    if (phase !== 'READY') return;
+
+    if (pendingScrollToBottomRef.current && hasNewerGap(frontierIndices)) {
+      maybeQueueFrontier('forward');
+      return;
+    }
+
+    if (pendingScrollKeyRef.current) {
+      const targetIndex = keyToIndex.get(pendingScrollKeyRef.current);
+      if (targetIndex == null) {
+        pendingScrollKeyRef.current = null;
+        return;
+      }
+
+      if (!frontierIndices) return;
+      if (targetIndex < frontierIndices.start) {
+        maybeQueueFrontier('backward');
+      } else if (targetIndex > frontierIndices.end) {
+        maybeQueueFrontier('forward');
+      }
+    }
+  }, [frontierIndices, hasNewerGap, keyToIndex, maybeQueueFrontier, phase]);
+
+  useEffect(() => {
+    if (!scrollApiRef) return;
+
+    scrollApiRef.current = {
+      scrollToBottom: () => {
+        pendingScrollKeyRef.current = null;
+        pendingScrollToBottomRef.current = true;
+
+        if (phaseRef.current !== 'READY') return;
+
+        if (hasNewerGap()) {
+          maybeQueueFrontier('forward');
+          return;
+        }
+
+        scrollToBottomInternal();
+        isAtBottomRef.current = true;
+        onAtBottomChange?.(true);
+        pendingScrollToBottomRef.current = false;
+      },
+      scrollToItem: (itemKey: string, behavior: ScrollBehavior = 'auto') => {
+        const currentRange = frontierIndicesRef.current;
+        const targetIndex = keyToIndexRef.current.get(itemKey);
+        if (targetIndex == null) return;
+
+        pendingScrollToBottomRef.current = false;
+
+        if (currentRange && targetIndex >= currentRange.start && targetIndex <= currentRange.end) {
+          scrollToKeyInternal(itemKey, behavior);
+          return;
+        }
+
+        pendingScrollKeyRef.current = itemKey;
+        pendingScrollBehaviorRef.current = behavior;
+
+        if (phaseRef.current === 'READY' && currentRange) {
+          maybeQueueFrontier(targetIndex < currentRange.start ? 'backward' : 'forward');
+        }
+      },
+    };
+
+    return () => {
+      if (scrollApiRef.current) {
+        scrollApiRef.current = null;
+      }
+    };
+  }, [hasNewerGap, maybeQueueFrontier, onAtBottomChange, scrollApiRef, scrollToBottomInternal, scrollToKeyInternal]);
 
   const onScrollIdleRef = useRef(onScrollIdle);
   onScrollIdleRef.current = onScrollIdle;
 
   const handleScroll = useCallback(() => {
-    if (phaseRef.current !== 'READY') return;
-    const el = containerRef.current;
-    if (!el) return;
+    const container = containerRef.current;
+    if (!container || !frontierIndicesRef.current) return;
 
-    pendingScrollTopRef.current = el.scrollTop;
+    pendingScrollTopRef.current = container.scrollTop;
     if (scrollRafRef.current == null) {
       scrollRafRef.current = requestAnimationFrame(() => {
         scrollRafRef.current = null;
@@ -425,189 +723,94 @@ export function VirtualScroll({
       });
     }
 
-    isScrollIdleRef.current = false;
     if (scrollIdleTimerRef.current) clearTimeout(scrollIdleTimerRef.current);
     scrollIdleTimerRef.current = setTimeout(() => {
-      isScrollIdleRef.current = true;
       onScrollIdleRef.current?.();
     }, 150);
 
-    // If container height changed, this scroll event was triggered by a
-    // container resize (e.g. textarea grew/shrank), not by user scrolling.
-    // Don't update isAtBottomRef — the ResizeObserver will handle it.
-    const isResizing = el.clientHeight !== containerHeightRef.current;
-    containerHeightRef.current = el.clientHeight;
+    updateAtBottom();
 
-    if (!isResizing) {
-      const wasAtBottom = isAtBottomRef.current;
-      isAtBottomRef.current = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
-      if (wasAtBottom !== isAtBottomRef.current) {
-        onAtBottomChange?.(isAtBottomRef.current);
+    const bottomDistance = container.scrollHeight - (container.scrollTop + container.clientHeight);
+
+    if (container.scrollTop - topChromeHeight < FRONTIER_THRESHOLD_PX) {
+      if (hasOlderGap()) {
+        maybeQueueFrontier('backward');
+      } else if (loadOlder.hasMore && !loadOlder.loading && container.scrollTop < FRONTIER_THRESHOLD_PX) {
+        loadOlder.onLoad();
       }
     }
 
-    if (onLoadOlder && el.scrollTop < loadMoreThreshold) {
-      onLoadOlder();
-    }
-
-    if (onLoadNewer && el.scrollHeight - el.scrollTop - el.clientHeight < loadMoreThreshold) {
-      onLoadNewer();
-    }
-  }, [onLoadOlder, onLoadNewer, loadMoreThreshold, onAtBottomChange]);
-
-  // Observe container resize
-  useEffect(() => {
-    const el = containerRef.current;
-    if (!el) return;
-    let prevH = el.clientHeight;
-    const ro = new ResizeObserver(() => {
-      const newH = el.clientHeight;
-      if (newH !== prevH) {
-        if (isAtBottomRef.current) {
-          el.scrollTop = el.scrollHeight - newH;
-        }
-        prevH = newH;
-        containerHeightRef.current = newH;
-        setContainerHeight(newH);
+    if (bottomDistance < FRONTIER_THRESHOLD_PX) {
+      if (hasNewerGap()) {
+        maybeQueueFrontier('forward');
+      } else if (loadNewer?.hasMore && !loadNewer.loading && bottomDistance < FRONTIER_THRESHOLD_PX) {
+        loadNewer.onLoad();
       }
-    });
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, []);
+    }
+  }, [hasNewerGap, hasOlderGap, loadNewer, loadOlder, maybeQueueFrontier, topChromeHeight, updateAtBottom]);
 
   useEffect(() => {
     return () => {
-      if (scrollIdleTimerRef.current) {
-        clearTimeout(scrollIdleTimerRef.current);
-      }
-      if (scrollRafRef.current != null) {
-        cancelAnimationFrame(scrollRafRef.current);
-      }
-      if (batchTimerRef.current != null) {
-        cancelAnimationFrame(batchTimerRef.current);
-      }
-      if (safetyTimeoutRef.current) {
-        clearTimeout(safetyTimeoutRef.current);
-      }
+      if (scrollIdleTimerRef.current) clearTimeout(scrollIdleTimerRef.current);
+      if (scrollRafRef.current != null) cancelAnimationFrame(scrollRafRef.current);
     };
   }, []);
 
-  const loadingRowHeight = 36;
-  const topPadding = (loadingOlder ? loadingRowHeight : 0) + headerHeight;
-
-  // MEASURING phase: render ALL items invisibly
-  if (phase === 'MEASURING') {
-    const measuringItems: ReactNode[] = [];
-    for (let i = 0; i < totalItems; i++) {
-      measuringItems.push(
-        <MeasuredItem key={`${windowKey}-${i}`} index={i} offset={0} onResize={handleResize} invisible>
-          {renderItem(i)}
-        </MeasuredItem>,
+  const committedRows: ReactNode[] = [];
+  if (frontierIndices) {
+    for (let index = frontierIndices.start; index <= frontierIndices.end; index++) {
+      const item = items[index];
+      const itemKey = itemKeys[index];
+      committedRows.push(
+        <MeasuredRow
+          key={itemKey}
+          itemKey={itemKey}
+          onMeasure={handleMeasure}
+          registerRow={registerRow}
+        >
+          {renderItem(item, index)}
+        </MeasuredRow>,
       );
     }
+  }
+
+  const stagingRows = pendingBatch?.keys.map((itemKey) => {
+    const index = keyToIndex.get(itemKey);
+    if (index == null) return null;
 
     return (
-      <div ref={containerRef} className={styles.container} onScroll={handleScroll} style={{ opacity: 0 }}>
-        <div
-          ref={spacerRef}
-          className={styles.spacer}
-          style={{ height: totalItems * estimatedItemHeight + topPadding + bottomPadding }}
-        >
-          {loadingOlder && (
-            <div className={styles.loadingRow} style={{ height: loadingRowHeight }}>
-              Loading…
-            </div>
-          )}
-          {header && (
-            <div
-              ref={headerRef}
-              style={{ position: 'absolute', top: loadingOlder ? loadingRowHeight : 0, left: 0, right: 0 }}
-            >
-              {header}
-            </div>
-          )}
-          {measuringItems}
-        </div>
-      </div>
+      <MeasuredRow key={`staging-${itemKey}`} itemKey={itemKey} hidden onMeasure={handleMeasure}>
+        {renderItem(items[index], index)}
+      </MeasuredRow>
     );
-  }
-
-  // READY phase: compute visible range and render normally
-  const startIndex = Math.max(0, findStartIndex(scrollTop) - overscan);
-  const endOffset = scrollTop + containerHeight;
-  let endIndex = startIndex;
-  {
-    let offset = getItemOffset(startIndex);
-    for (let i = startIndex; i < totalItems; i++) {
-      if (offset > endOffset) {
-        endIndex = Math.min(totalItems - 1, i + overscan);
-        break;
-      }
-      offset += getHeight(i);
-      endIndex = i;
-    }
-    if (endIndex === totalItems - 1 || offset <= endOffset) {
-      endIndex = Math.min(totalItems - 1, endIndex + overscan);
-    }
-  }
-
-  // Collect visible items + unmeasured items near viewport for pre-measurement
-  const itemsToRender = new Set<number>();
-  for (let i = startIndex; i <= endIndex; i++) {
-    itemsToRender.add(i);
-  }
-
-  // Pre-measure unmeasured items near the viewport (e.g., newly prepended/appended)
-  const maxPreMeasure = 20;
-  let preMeasured = 0;
-  for (let i = startIndex - 1; i >= 0 && preMeasured < maxPreMeasure; i--) {
-    if (!heightCache.current.has(i)) {
-      itemsToRender.add(i);
-      preMeasured++;
-    }
-  }
-  for (let i = endIndex + 1; i < totalItems && preMeasured < maxPreMeasure; i++) {
-    if (!heightCache.current.has(i)) {
-      itemsToRender.add(i);
-      preMeasured++;
-    }
-  }
-
-  const visibleItems: ReactNode[] = Array.from(itemsToRender)
-    .sort((a, b) => a - b)
-    .map((i) => {
-      const isVisible = i >= startIndex && i <= endIndex;
-      const offset = isVisible ? getItemOffset(i) + topPadding : 0;
-      return (
-        <MeasuredItem
-          key={`${windowKey}-${i}`}
-          index={i}
-          offset={offset}
-          onResize={handleResize}
-          invisible={!isVisible}
-        >
-          {renderItem(i)}
-        </MeasuredItem>
-      );
-    });
+  });
 
   return (
-    <div ref={containerRef} className={styles.container} onScroll={handleScroll}>
-      <div ref={spacerRef} className={styles.spacer} style={{ height: totalHeight + topPadding + bottomPadding }}>
-        {loadingOlder && (
+    <div
+      ref={containerRef}
+      className={styles.container}
+      onScroll={handleScroll}
+      style={phase !== 'READY' ? { opacity: 0 } : undefined}
+    >
+      <div ref={flowContentRef} className={styles.flowContent} style={{ paddingBottom: bottomPadding }}>
+        {loadOlder.loading && (
           <div className={styles.loadingRow} style={{ height: loadingRowHeight }}>
             Loading…
           </div>
         )}
-        {header && (
-          <div
-            ref={headerRef}
-            style={{ position: 'absolute', top: loadingOlder ? loadingRowHeight : 0, left: 0, right: 0 }}
-          >
-            {header}
+        {header && <div ref={headerRef}>{header}</div>}
+        {topSpinnerHeight > 0 && (
+          <div className={styles.loadingRow} style={{ height: topSpinnerHeight }}>
+            Loading…
           </div>
         )}
-        {visibleItems}
+        {committedRows}
+        {bottomSpinnerHeight > 0 && (
+          <div className={styles.loadingRow} style={{ height: bottomSpinnerHeight }}>
+            Loading…
+          </div>
+        )}
+        <div className={styles.stagingArea}>{stagingRows}</div>
       </div>
     </div>
   );

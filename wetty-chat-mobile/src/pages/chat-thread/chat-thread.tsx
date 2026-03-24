@@ -56,7 +56,7 @@ import {
 import { messageAdded, messageConfirmed, messagePatched, reactionsUpdated } from '@/store/messageEvents';
 import type { RootState } from '@/store/index';
 import store from '@/store/index';
-import { VirtualScroll } from '@/components/chat/VirtualScroll';
+import { type VirtualScrollAnchor, type VirtualScrollHandle, VirtualScroll } from '@/components/chat/VirtualScroll';
 import { ChatBubble } from '@/components/chat/ChatBubble';
 import {
   type ComposeSendPayload,
@@ -171,18 +171,15 @@ function ChatThreadCore({ chatId, threadId, backAction }: ChatThreadCoreProps) {
     });
   }, []);
 
-  const scrollToBottomRef = useRef<(() => void) | null>(null);
-  const scrollToIndexRef = useRef<((index: number, behavior?: ScrollBehavior) => void) | null>(null);
+  const scrollApiRef = useRef<VirtualScrollHandle | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
   const loadingMoreRef = useRef(false);
   const loadingNewerRef = useRef(false);
-  const [prependedCount, setPrependedCount] = useState(0);
   const pendingPrependRef = useRef<{ messages: MessageResponse[]; nextCursor: string | null; gen: number } | null>(
     null,
   );
   const isScrollIdleRef = useRef(true);
-  const [windowKey, setWindowKey] = useState(0);
-  const [initialScrollIndex, setInitialScrollIndex] = useState<number | undefined>(undefined);
+  const [initialAnchor, setInitialAnchor] = useState<VirtualScrollAnchor>({ type: 'bottom', token: 0 });
 
   const [atBottom, setAtBottom] = useState(true);
   const [replyingTo, setReplyingTo] = useState<MessageResponse | null>(null);
@@ -193,6 +190,8 @@ function ChatThreadCore({ chatId, threadId, backAction }: ChatThreadCoreProps) {
   const [presentToast] = useIonToast();
   const [presentAlert] = useIonAlert();
   const [overlayMessage, setOverlayMessage] = useState<{ message: MessageResponse; sourceRect: DOMRect } | null>(null);
+
+  const getMessageKey = useCallback((message: MessageResponse) => message.client_generated_id || message.id, []);
 
   const startEditingMessage = useCallback((message: MessageResponse) => {
     setReplyingTo(null);
@@ -264,13 +263,13 @@ function ChatThreadCore({ chatId, threadId, backAction }: ChatThreadCoreProps) {
             prevCursor: null,
           }),
         );
-        setPrependedCount(0);
         pendingPrependRef.current = null;
-        setWindowKey((k) => k + 1);
-        setInitialScrollIndex(undefined);
+        setInitialAnchor((currentAnchor) => ({ type: 'bottom', token: currentAnchor.token + 1 }));
       })
       .catch((err: Error) => {
         dispatch(resetChat({ chatId: storeChatId, messages: [], nextCursor: null, prevCursor: null }));
+        pendingPrependRef.current = null;
+        setInitialAnchor((currentAnchor) => ({ type: 'bottom', token: currentAnchor.token + 1 }));
         showToast(err.message || t`Failed to load messages`);
       });
   }, [chatId, storeChatId, threadId, dispatch, showToast]);
@@ -286,7 +285,6 @@ function ChatThreadCore({ chatId, threadId, backAction }: ChatThreadCoreProps) {
     pendingPrependRef.current = null;
     if (selectChatGeneration(store.getState(), storeChatId) !== pending.gen) return;
     dispatch(prependMessages({ chatId: storeChatId, messages: pending.messages, nextCursor: pending.nextCursor }));
-    setPrependedCount((c) => c + pending.messages.length);
     loadingMoreRef.current = false;
     setLoadingMore(false);
   }, [storeChatId, dispatch]);
@@ -312,7 +310,6 @@ function ChatThreadCore({ chatId, threadId, backAction }: ChatThreadCoreProps) {
         if (isScrollIdleRef.current) {
           // Scroll already stopped — flush immediately
           dispatch(prependMessages({ chatId: storeChatId, messages: list, nextCursor: pending.nextCursor }));
-          setPrependedCount((c) => c + list.length);
           loadingMoreRef.current = false;
           setLoadingMore(false);
         } else {
@@ -377,7 +374,7 @@ function ChatThreadCore({ chatId, threadId, backAction }: ChatThreadCoreProps) {
       const currentMessages = selectMessagesForChat(state, storeChatId);
       const idx = currentMessages.findIndex((m) => m.id === messageId);
       if (idx !== -1) {
-        scrollToIndexRef.current?.(idx, 'smooth');
+        scrollApiRef.current?.scrollToItem(getMessageKey(currentMessages[idx]), 'smooth');
         return;
       }
       // Message not in current window — fetch centered window
@@ -392,19 +389,17 @@ function ChatThreadCore({ chatId, threadId, backAction }: ChatThreadCoreProps) {
               prevCursor: res.data.prev_cursor ?? null,
             }),
           );
-          const idx = list.findIndex((m) => m.id === messageId);
-          setInitialScrollIndex(idx !== -1 ? idx : undefined);
-          setWindowKey((k) => k + 1);
-          setPrependedCount(0);
           pendingPrependRef.current = null;
+          setInitialAnchor((currentAnchor) => ({ type: 'item', key: messageId, token: currentAnchor.token + 1 }));
         })
         .catch((err: Error) => {
           showToast(err.message || t`Failed to jump to message`);
         });
     },
-    [chatId, storeChatId, threadId, dispatch, showToast],
+    [chatId, dispatch, getMessageKey, showToast, storeChatId, threadId],
   );
 
+  const nextCursor = useSelector((state: RootState) => selectNextCursorForChat(state, storeChatId));
   const prevCursor = useSelector((state: RootState) => selectPrevCursorForChat(state, storeChatId));
 
   const uploadAttachment = useCallback(async ({ file, dimensions, onProgress, signal }: ComposeUploadInput) => {
@@ -515,7 +510,7 @@ function ChatThreadCore({ chatId, threadId, backAction }: ChatThreadCoreProps) {
         }),
       );
       setReplyingTo(null);
-      setTimeout(() => scrollToBottomRef.current?.(), 50);
+      setTimeout(() => scrollApiRef.current?.scrollToBottom(), 50);
 
       const messagePayload = {
         message: text,
@@ -695,23 +690,16 @@ function ChatThreadCore({ chatId, threadId, backAction }: ChatThreadCoreProps) {
 
       <IonContent className="chat-thread-content" scrollX={false} scrollY={false}>
         <VirtualScroll
-          totalItems={messages.length}
-          estimatedItemHeight={60}
-          overscan={10}
-          loadingOlder={loadingMore}
-          onLoadOlder={loadMore}
-          onLoadNewer={prevCursor != null ? loadNewer : undefined}
-          loadMoreThreshold={200}
-          prependedCount={prependedCount}
-          scrollToBottomRef={scrollToBottomRef}
-          scrollToIndexRef={scrollToIndexRef}
+          items={messages}
+          initialAnchor={initialAnchor}
+          loadOlder={{ hasMore: nextCursor != null, loading: loadingMore, onLoad: loadMore }}
+          loadNewer={prevCursor != null ? { hasMore: true, onLoad: loadNewer } : undefined}
+          scrollApiRef={scrollApiRef}
           bottomPadding={16}
-          windowKey={windowKey}
-          initialScrollIndex={initialScrollIndex}
           onAtBottomChange={setAtBottom}
           onScrollIdle={handleScrollIdle}
-          renderItem={(index: number) => {
-            const msg = messages[index];
+          getItemKey={(message: MessageResponse) => getMessageKey(message)}
+          renderItem={(msg: MessageResponse, index: number) => {
             const prevMsg = index > 0 ? messages[index - 1] : null;
             const nextMsg = index < messages.length - 1 ? messages[index + 1] : null;
 
@@ -805,7 +793,7 @@ function ChatThreadCore({ chatId, threadId, backAction }: ChatThreadCoreProps) {
               if (prevCursor != null) {
                 fetchLatestWindow();
               } else {
-                scrollToBottomRef.current?.();
+                scrollApiRef.current?.scrollToBottom();
               }
             }}
           >

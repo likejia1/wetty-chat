@@ -62,7 +62,10 @@ function confirmPendingInWindows(
   for (const win of chat.windows) {
     const idx = win.messages.findIndex((m) => m.client_generated_id === clientGeneratedId);
     if (idx !== -1) {
-      win.messages[idx] = message;
+      win.messages[idx] = {
+        ...message,
+        client_generated_id: message.client_generated_id || clientGeneratedId,
+      };
       return;
     }
   }
