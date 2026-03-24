@@ -22,6 +22,7 @@ import { Trans } from '@lingui/react/macro';
 import { markMessagesAsRead, type MessageResponse } from '@/api/messages';
 import { t } from '@lingui/core/macro';
 import { clearAppBadgeCount, setAppBadgeCount } from '@/utils/badges';
+import { getMessagePreviewText } from './messagePreview';
 import styles from './ChatList.module.scss';
 
 function formatLastActivity(isoString: string | null, locale: string): string {
@@ -73,21 +74,18 @@ function isChatMuted(chat: ChatListItem): boolean {
 
 function getMessagePreview(message: MessageResponse | null): ReactNode {
   if (!message) return t`No messages yet`;
-  if (message.is_deleted) return t`[Deleted]`;
 
   const senderName = message.sender?.name || 'User';
-  let previewText = t`New message`;
-
-  switch (message.message_type) {
-    case 'text':
-      previewText = message.message || t`Text message`;
-      break;
-  }
+  const previewText = getMessagePreviewText({
+    message: message.message,
+    attachments: message.attachments,
+    isDeleted: message.is_deleted,
+  });
 
   return (
     <>
       <span className={styles.chatsListPreviewSender}>{senderName}: </span>
-      {previewText}
+      {previewText || t`New message`}
     </>
   );
 }

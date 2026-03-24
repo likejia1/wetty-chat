@@ -1,7 +1,15 @@
 import { useRef, useState } from 'react';
 import { IonIcon } from '@ionic/react';
 import { useSelector } from 'react-redux';
-import { arrowUndo, chatbubbles, checkmarkCircle, checkmarkCircleOutline, documentOutline, femaleOutline, maleOutline } from 'ionicons/icons';
+import {
+  arrowUndo,
+  chatbubbles,
+  checkmarkCircle,
+  checkmarkCircleOutline,
+  documentOutline,
+  femaleOutline,
+  maleOutline,
+} from 'ionicons/icons';
 import { t } from '@lingui/core/macro';
 import styles from './ChatBubble.module.scss';
 import type { Attachment, ReactionSummary, UserGroupInfo } from '@/api/messages';
@@ -246,18 +254,16 @@ export function ChatBubble({
           <div ref={bubbleRef} className={styles.bubble} style={{ fontSize: chatFontSizeStyle }}>
             {showName && (
               <div className={styles.sender}>
-                <span className={styles.senderName}>
-                  {senderName}
-                </span>
+                <span className={styles.senderName}>{senderName}</span>
                 {senderGroup && (
                   <span className={styles.senderGroup} color={senderGroup.chat_group_color!}>
                     {senderGroup.name}
                   </span>
                 )}
                 {senderGender === 2 ? (
-                  <IonIcon icon={femaleOutline} className={styles.gender2}/>
+                  <IonIcon icon={femaleOutline} className={styles.gender2} />
                 ) : (
-                  <IonIcon icon={maleOutline} className={styles.gender1}/>
+                  <IonIcon icon={maleOutline} className={styles.gender1} />
                 )}
               </div>
             )}
