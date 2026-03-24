@@ -346,13 +346,8 @@ pub struct ReplyToMessage {
 type DbConn = diesel::r2d2::PooledConnection<diesel::r2d2::ConnectionManager<diesel::PgConnection>>;
 
 fn load_username_by_uid(conn: &mut DbConn, uid: i32) -> QueryResult<Option<String>> {
-    use crate::schema::discuz::discuz::common_member::dsl as cm_dsl;
-
-    cm_dsl::common_member
-        .filter(cm_dsl::uid.eq(uid))
-        .select(cm_dsl::username)
-        .first::<String>(conn)
-        .optional()
+    lookup_user_profiles(conn, &[uid])
+        .map(|mut profiles| profiles.remove(&uid).and_then(|profile| profile.username))
 }
 
 fn load_usernames_by_uids(

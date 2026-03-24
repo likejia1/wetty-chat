@@ -14,6 +14,10 @@ pub struct UserProfile {
     pub user_group: Option<UserGroupInfo>,
 }
 
+pub(crate) fn normalize_discuz_username(username: &str) -> String {
+    username.trim_end().to_string()
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UserSearchMode {
@@ -180,7 +184,7 @@ pub fn lookup_user_profiles(
                 (
                     uid,
                     UserProfile {
-                        username: Some(username),
+                        username: Some(normalize_discuz_username(&username)),
                         gender: gender.unwrap_or(0),
                         user_group: Some(UserGroupInfo {
                             group_id,
@@ -193,4 +197,29 @@ pub fn lookup_user_profiles(
             },
         )
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_discuz_username;
+
+    #[test]
+    fn normalize_discuz_username_leaves_plain_values_unchanged() {
+        assert_eq!(normalize_discuz_username("alice"), "alice");
+    }
+
+    #[test]
+    fn normalize_discuz_username_removes_trailing_spaces() {
+        assert_eq!(normalize_discuz_username("alice   "), "alice");
+    }
+
+    #[test]
+    fn normalize_discuz_username_keeps_leading_spaces() {
+        assert_eq!(normalize_discuz_username("  alice   "), "  alice");
+    }
+
+    #[test]
+    fn normalize_discuz_username_handles_all_space_values() {
+        assert_eq!(normalize_discuz_username("     "), "");
+    }
 }
