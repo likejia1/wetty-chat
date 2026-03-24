@@ -18,8 +18,6 @@ export function useStagingBatch(
   const [pendingBatch, setPendingBatch] = useState<PendingBatch | null>(null);
   const pendingBatchRef = useRef<PendingBatch | null>(null);
   const pendingMeasurementsRef = useRef(new Map<string, number>());
-  const onBatchReadyRef = useRef(onBatchReady);
-  onBatchReadyRef.current = onBatchReady;
 
   const queueBatch = useCallback((batch: PendingBatch): boolean => {
     if (!batch.keys.length || pendingBatchRef.current) return false;
@@ -35,20 +33,23 @@ export function useStagingBatch(
     setPendingBatch(null);
   }, []);
 
-  const handleStagingMeasure = useCallback((key: string, height: number) => {
-    const batch = pendingBatchRef.current;
-    if (!batch || !batch.keys.includes(key)) return;
+  const handleStagingMeasure = useCallback(
+    (key: string, height: number) => {
+      const batch = pendingBatchRef.current;
+      if (!batch || !batch.keys.includes(key)) return;
 
-    pendingMeasurementsRef.current.set(key, height);
+      pendingMeasurementsRef.current.set(key, height);
 
-    if (batch.keys.every((k) => pendingMeasurementsRef.current.has(k))) {
-      const heights = pendingMeasurementsRef.current;
-      pendingMeasurementsRef.current = new Map();
-      pendingBatchRef.current = null;
-      setPendingBatch(null);
-      onBatchReadyRef.current(batch, heights);
-    }
-  }, []);
+      if (batch.keys.every((k) => pendingMeasurementsRef.current.has(k))) {
+        const heights = pendingMeasurementsRef.current;
+        pendingMeasurementsRef.current = new Map();
+        pendingBatchRef.current = null;
+        setPendingBatch(null);
+        onBatchReady(batch, heights);
+      }
+    },
+    [onBatchReady],
+  );
 
   return { pendingBatch, queueBatch, cancelBatch, handleStagingMeasure };
 }

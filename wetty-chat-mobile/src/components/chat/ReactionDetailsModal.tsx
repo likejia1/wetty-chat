@@ -20,28 +20,37 @@ interface ReactionDetailsModalProps {
 
 export function ReactionDetailsModal({ chatId, messageId, initialEmoji, onDismiss }: ReactionDetailsModalProps) {
   const isDesktop = useIsDesktop();
-  const [groups, setGroups] = useState<ReactionGroup[]>([]);
-  const [selectedEmoji, setSelectedEmoji] = useState<string | undefined>(initialEmoji);
-  const [loading, setLoading] = useState(false);
+  const [groupsState, setGroupsState] = useState<{ messageId: string | null; groups: ReactionGroup[] }>({
+    messageId: null,
+    groups: [],
+  });
+  const [selectedState, setSelectedState] = useState<{ messageId: string | null; emoji?: string }>({
+    messageId: null,
+    emoji: initialEmoji,
+  });
 
   useEffect(() => {
-    if (!messageId) {
-      setGroups([]);
-      return;
-    }
-    setLoading(true);
-    setSelectedEmoji(initialEmoji);
+    if (!messageId) return;
+
+    let cancelled = false;
     getReactionDetails(chatId, messageId)
       .then((res) => {
-        setGroups(res.data.reactions);
-        if (!initialEmoji && res.data.reactions.length > 0) {
-          setSelectedEmoji(res.data.reactions[0].emoji);
-        }
+        if (cancelled) return;
+        setGroupsState({ messageId, groups: res.data.reactions });
       })
-      .catch(() => setGroups([]))
-      .finally(() => setLoading(false));
+      .catch(() => {
+        if (cancelled) return;
+        setGroupsState({ messageId, groups: [] });
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, [chatId, messageId, initialEmoji]);
 
+  const groups = groupsState.messageId === messageId ? groupsState.groups : [];
+  const selectedEmoji = selectedState.messageId === messageId ? selectedState.emoji : initialEmoji;
+  const loading = messageId != null && groupsState.messageId !== messageId;
   const activeGroup = groups.find((g) => g.emoji === selectedEmoji) ?? groups[0];
 
   return (
@@ -78,7 +87,7 @@ export function ReactionDetailsModal({ chatId, messageId, initialEmoji, onDismis
           {groups.map((g) => (
             <button
               key={g.emoji}
-              onClick={() => setSelectedEmoji(g.emoji)}
+              onClick={() => setSelectedState({ messageId, emoji: g.emoji })}
               style={{
                 padding: '4px 12px',
                 borderRadius: 16,

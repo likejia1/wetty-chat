@@ -108,6 +108,7 @@ export function GeneralSettingsCore({ backAction, onOpenLanguage }: GeneralSetti
               <div className={styles.previewBubble}>
                 <ChatBubble
                   senderName={i18n._(t`Alex`)}
+                  senderGender={1}
                   message={i18n._(t`This is how your messages will look in chat.`)}
                   isSent={false}
                   showAvatar={true}

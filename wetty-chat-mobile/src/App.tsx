@@ -52,12 +52,7 @@ function AppShell() {
   const token = useDeviceToken(true);
   useAppLifecycle();
   const { needRefresh, setNeedRefresh, updateServiceWorker } = useAppUpdate();
-
-  if (import.meta.env.PROD) {
-    if (!token || token.length === 0) {
-      return <h1>I'm a tea pot</h1>;
-    }
-  }
+  const missingProdToken = import.meta.env.PROD && (!token || token.length === 0);
 
   useEffect(() => {
     syncStoredJwtToken();
@@ -67,6 +62,10 @@ function AppShell() {
     }
     dispatch(fetchCurrentUser());
   }, [dispatch]);
+
+  if (missingProdToken) {
+    return <h1>I'm a tea pot</h1>;
+  }
 
   return (
     <IonApp>

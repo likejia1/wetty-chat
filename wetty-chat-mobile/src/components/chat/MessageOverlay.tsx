@@ -1,10 +1,10 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { IonIcon } from '@ionic/react';
 import { checkmarkCircle, checkmarkCircleOutline, documentOutline } from 'ionicons/icons';
 import { t } from '@lingui/core/macro';
 import { useSelector } from 'react-redux';
-import { renderMessageWithLinks } from './ChatBubble';
+import { renderMessageWithLinks } from './renderMessageWithLinks';
 import { getMessagePreviewText } from './messagePreview';
 import { selectChatFontSizeStyle } from '@/store/settingsSlice';
 import type { Attachment } from '@/api/messages';
@@ -64,13 +64,12 @@ export function MessageOverlay({
   onClose,
 }: MessageOverlayProps) {
   const contentRef = useRef<HTMLDivElement>(null);
-  const [position, setPosition] = useState<{ top: number; left: number } | null>(null);
   const chatFontSizeStyle = useSelector(selectChatFontSizeStyle);
 
   // Compute position after first render so we know the full content dimensions
-  useEffect(() => {
-    if (!contentRef.current) return;
+  useLayoutEffect(() => {
     const content = contentRef.current;
+    if (!content) return;
     const contentRect = content.getBoundingClientRect();
     const pad = 40;
     const vh = window.innerHeight;
@@ -102,8 +101,10 @@ export function MessageOverlay({
       left = pad;
     }
 
-    setPosition({ top, left });
-  }, [sourceRect]);
+    content.style.top = `${top}px`;
+    content.style.left = `${left}px`;
+    content.style.visibility = 'visible';
+  }, [isSent, sourceRect]);
 
   // Body scroll lock
   useEffect(() => {
@@ -137,12 +138,8 @@ export function MessageOverlay({
     <div className={styles.overlay} onClick={handleBackdropClick}>
       <div
         ref={contentRef}
-        className={`${styles.content} ${isSent ? styles.contentSent : ''} ${position ? styles.contentVisible : ''}`}
-        style={
-          position
-            ? { top: position.top, left: position.left }
-            : { top: sourceRect.top, left: sourceRect.left, visibility: 'hidden' }
-        }
+        className={`${styles.content} ${isSent ? styles.contentSent : ''} ${styles.contentVisible}`}
+        style={{ top: sourceRect.top, left: sourceRect.left, visibility: 'hidden' }}
       >
         {/* Reaction bar */}
         {reactions && (

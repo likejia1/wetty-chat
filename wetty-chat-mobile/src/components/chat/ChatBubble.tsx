@@ -15,38 +15,9 @@ import styles from './ChatBubble.module.scss';
 import type { Attachment, ReactionSummary, UserGroupInfo } from '@/api/messages';
 import { ImageViewer } from './ImageViewer';
 import { getMessagePreviewText } from './messagePreview';
+import { renderMessageWithLinks } from './renderMessageWithLinks';
 import { selectChatFontSizeStyle } from '@/store/settingsSlice';
 import { UserAvatar } from '@/components/UserAvatar';
-
-const URL_REGEX = /(https?:\/\/[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+)/g;
-const TRAILING_PUNCT = /[.,);!?]+$/;
-
-export function renderMessageWithLinks(message: string): React.ReactNode[] {
-  const parts = message.split(URL_REGEX);
-  if (parts.length === 1) return [message];
-
-  return parts.map((part, i) => {
-    if (i % 2 === 1) {
-      const trimmed = part.replace(TRAILING_PUNCT, '');
-      const suffix = part.slice(trimmed.length);
-      return (
-        <span key={i}>
-          <a
-            href={trimmed}
-            className={styles.messageLink}
-            target="_blank"
-            rel="noopener noreferrer"
-            onClick={(e) => e.stopPropagation()}
-          >
-            {trimmed}
-          </a>
-          {suffix}
-        </span>
-      );
-    }
-    return part;
-  });
-}
 
 interface ChatBubbleProps {
   senderName: string;

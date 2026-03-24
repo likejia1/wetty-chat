@@ -6,12 +6,12 @@ import type { MessageResponse } from '@/api/messages';
 export type ChatRow =
   | { type: 'date'; key: string; dateLabel: string }
   | {
-      type: 'message';
-      key: string;
-      message: MessageResponse;
-      showName: boolean;
-      showAvatar: boolean;
-    };
+    type: 'message';
+    key: string;
+    message: MessageResponse;
+    showName: boolean;
+    showAvatar: boolean;
+  };
 
 // ── Geometry ──
 
@@ -78,12 +78,12 @@ export interface ChatVirtualScrollProps {
 
 // ── Constants ──
 
-export const BOOTSTRAP_HEIGHT_MULTIPLIER = 1.5;
-export const STAGING_BATCH_SIZE = 12;
-export const MOUNT_OVERSCAN = 8;
+export const BOOTSTRAP_HEIGHT_MULTIPLIER = 2;
+export const STAGING_BATCH_SIZE = 40;
+export const MOUNT_OVERSCAN = 30;
 export const MOUNT_CAP = 80;
 export const CORE_CAP = 200;
 export const VIEWPORT_TRIGGER_PX = 300;
 export const BOUNDARY_HEIGHT_PX = 60;
-export const SCROLL_IDLE_MS = 150;
+export const SCROLL_IDLE_MS = 200;
 export const AT_BOTTOM_THRESHOLD_PX = 30;
