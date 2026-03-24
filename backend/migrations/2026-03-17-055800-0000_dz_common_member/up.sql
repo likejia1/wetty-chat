@@ -27,8 +27,7 @@ CREATE TABLE IF NOT EXISTS discuz.common_member (
 	allowadmincp int2 DEFAULT '0'::smallint NOT NULL,
 	onlyacceptfriendpm int2 DEFAULT '0'::smallint NOT NULL,
 	conisbind int2 DEFAULT '0'::smallint NOT NULL,
-	"freeze" int2 DEFAULT '0'::smallint NOT NULL,
-	CONSTRAINT idx_44357_primary PRIMARY KEY (uid)
+	"freeze" int2 DEFAULT '0'::smallint NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_44357_conisbind ON discuz.common_member USING btree (conisbind);
 CREATE INDEX IF NOT EXISTS idx_44357_email ON discuz.common_member USING btree (email);
