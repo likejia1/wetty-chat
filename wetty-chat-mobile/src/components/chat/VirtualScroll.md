@@ -171,3 +171,260 @@ src/components/chat/virtualScroll/
 7. **Unmeasured core rows stay mounted** — only rows with exact cached heights may move into spacers
 8. **Height cache persists** — measurement work is never discarded, only the core range is bounded
 9. **Optimistic confirmation must not remount a row** — `client_generated_id` is stable across confirmation
+
+## Debug Test Plan
+
+This plan is for reproducing and narrowing the chat-switch regressions seen in development:
+
+- After loading older history, switching to another chat and back can leave the thread blank
+- After switching back, the thread is sometimes not pinned to bottom even though the page is expected to reopen at bottom
+
+### Environment
+
+- Dev server: `http://10.42.2.114:5173`
+- Heavy-history chat: `/chats/chat/116143034872496128`
+- Secondary chat for switch-away: any other chat visible in the left chat list with a stable route
+- Run this on desktop width first so the chat list stays visible while switching chats
+
+### Core Assertions
+
+For every scenario below, verify all of these:
+
+1. The returning chat renders actual message rows, not an empty/blank viewport
+2. The virtual scroll container is in `READY` behaviorally:
+   - content is visible
+   - scrolling works
+   - top/bottom boundaries appear only when expected
+3. On re-entering the heavy-history chat, the viewport is pinned to bottom
+4. No extra history fetch loop is triggered while parked at the top edge after an older-page load
+5. Switching chats does not preserve a stale mid-history viewport from the previous visit unless that becomes an explicit product decision later
+
+### What To Watch While Testing
+
+- Visual:
+  - blank message area
+  - visible top or bottom boundary rows in the wrong state
+  - landing above the latest messages after returning to the chat
+- Console:
+  - `[ChatVirtualScroll] scroll-position-write`
+  - `[ChatVirtualScroll] scroll-idle`
+  - `[ChatThread] loadMore resolved`
+- DOM metrics from the virtual scroll container:
+  - `scrollTop`
+  - `clientHeight`
+  - `scrollHeight`
+  - `bottomDistance = scrollHeight - (scrollTop + clientHeight)`
+  - container inline opacity
+
+Suggested probe in DevTools console:
+
+```js
+const el = document.querySelector('div[class*="_container_"]');
+({
+  scrollTop: el?.scrollTop,
+  clientHeight: el?.clientHeight,
+  scrollHeight: el?.scrollHeight,
+  bottomDistance: el ? el.scrollHeight - (el.scrollTop + el.clientHeight) : null,
+  opacity: el ? getComputedStyle(el).opacity : null,
+  textLength: el?.innerText?.trim().length ?? 0,
+});
+```
+
+Pass guidance:
+
+- Healthy bottom state: `bottomDistance <= 30`
+- Blank-state suspicion: `opacity === "0"` after navigation settles, or `textLength === 0` while message data is known to exist
+
+### Scenario 1: Baseline Open At Bottom
+
+1. Open the heavy-history chat directly
+2. Wait for initial bootstrap to settle
+3. Confirm the latest messages are visible
+4. Confirm `bottomDistance <= 30`
+
+Expected:
+
+- Initial anchor resolves to bottom
+- No blank viewport during bootstrap completion
+
+### Scenario 2: Load Older History, Stay In Same Chat
+
+1. Start from the settled bottom state
+2. Scroll upward repeatedly until older history loads
+3. Stop at the top edge and wait for the fetch to resolve
+4. Confirm the visible viewport is preserved after prepend
+5. Move away from the exact top edge and confirm load re-arming works normally
+
+Expected:
+
+- Older page loads exactly once per top-edge arm
+- After prepend, the visible content does not jump to unrelated rows
+- The thread remains scrollable and non-blank
+
+### Scenario 3: Load Older History, Switch Away, Return
+
+1. From Scenario 2, after at least one successful older-history load, switch to another chat using in-app navigation
+2. Wait for the second chat to settle
+3. Switch back to the heavy-history chat using in-app navigation
+4. Inspect the viewport immediately and again after a short settle delay
+
+Expected:
+
+- The heavy-history chat is visible immediately after re-entry
+- The chat reopens at bottom, not at the old mid-history viewport
+- No transient blank state that remains stuck after layout settles
+
+### Scenario 4: Repeat Chat Switching
+
+1. Perform Scenario 3 three to five times in a row
+2. Vary the point where you switch away:
+   - immediately after older-history load
+   - while positioned mid-history
+   - after manually scrolling back to bottom
+
+Expected:
+
+- Re-entry behavior is stable across repeated mounts/resets
+- No cumulative drift in `bottomDistance`
+- No one-time blank screen that only appears after the second or third switch
+
+### Scenario 5: Fast Switch During Recent Scroll Activity
+
+1. Scroll upward in the heavy-history chat
+2. Before the interaction feels fully settled, switch to another chat
+3. Switch back quickly
+
+Expected:
+
+- Pending scroll-idle work from the previous chat does not corrupt the new mount
+- The returning chat still resolves to bottom and renders rows
+
+### Scenario 6: Return After Explicit Scroll-To-Bottom Recovery
+
+1. Load older history
+2. Manually scroll back to bottom
+3. Switch away and back
+
+Expected:
+
+- Bottom anchoring remains correct
+- Return behavior should match Scenario 1, not preserve the earlier history exploration
+
+### Failure Notes To Capture
+
+When a failure happens, record:
+
+- Which scenario failed
+- Whether the failure was:
+  - blank viewport
+  - not at bottom
+  - repeated fetch loop
+  - wrong preserved anchor
+- The virtual scroll metrics at failure time
+- The last relevant console lines before and after the navigation
+- Whether the issue self-healed after one animation frame / one second / manual scroll
+
+### Observed DevTools Repros
+
+These were reproduced against the live dev server in Chrome DevTools while switching away from the heavy-history chat and then returning to it.
+
+#### 1. Spacer-only "blank" return state
+
+Observed state:
+
+- The container stayed in `READY` with `opacity: "1"`
+- `bottomDistance` reported `0`
+- `textLength` was tiny (`14`) because the only visible content was the `"Newer messages"` boundary row
+- The flow DOM contained:
+  - a giant top spacer
+  - a giant bottom spacer
+  - the bottom boundary row
+  - no mounted message rows
+
+Representative metrics:
+
+```js
+{
+  scrollTop: 25057,
+  clientHeight: 1092,
+  scrollHeight: 26149,
+  bottomDistance: 0,
+  opacity: "1",
+  textLength: 14,
+}
+```
+
+What this taught us:
+
+- This is not a normal hidden/bootstrap blank (`opacity: 0`)
+- The failing state can be "spacer-only" while still looking bottom-anchored by metrics
+- `useMountedWindow.recomputeMounted()` must be robust when `scrollTop` is beyond the measured core height
+- If visible range derivation produces an invalid range (`start > end`), the render can collapse into spacers plus a boundary row
+
+Patch note:
+
+- `useMountedWindow.ts` was hardened to clamp the effective measured offset and normalize the mounted range so it cannot invert during recompute
+
+#### 2. Return renders rows, but not at the true bottom
+
+Observed state:
+
+- The chat returned with real message rows mounted
+- The latest message was still not visible
+- The `"scroll to bottom"` affordance remained visible
+- `bottomDistance` stayed well above the healthy threshold, sometimes by only one boundary row (`~60px`), sometimes by several thousand pixels
+
+Representative metrics from one reproduced failure:
+
+```js
+{
+  scrollTop: 7505,
+  clientHeight: 1092,
+  scrollHeight: 12192,
+  bottomDistance: 3595,
+}
+```
+
+Representative metrics from a near-bottom but still failing state:
+
+```js
+{
+  scrollTop: 11070,
+  clientHeight: 1092,
+  scrollHeight: 12222,
+  bottomDistance: 60,
+}
+```
+
+What this taught us:
+
+- This is a different bug from the spacer-only blank state
+- The return path can perform multiple `scrollToBottomInternal()` writes and still settle above the latest message
+- A successful early bottom write does not prove the final mounted/core geometry stayed aligned with the bottom
+- It is important to inspect:
+  - whether `hasNewerGap()` is still true after the initial bottom snap
+  - whether forward expansion completes before the reopen-at-bottom intent is cleared
+  - whether mounted-window recomputation is still showing a mid-history slice after a bottom write
+  - whether late measurement/layout changes happen after the bottom-settle pass ends
+
+### Likely Code Paths To Inspect When A Failure Reproduces
+
+- Reset on anchor token change:
+  - clears refs/cache
+  - sets `container.scrollTop = 0`
+  - re-enters `BOOTSTRAP`
+- Bootstrap completion:
+  - whether the component reaches `READY`
+  - whether enough measured height exists below the anchor
+- Bottom-directed settle path:
+  - immediate `scrollToBottomInternal()`
+  - follow-up `scheduleBottomSettle()` pass
+  - whether reopen-at-bottom intent survives until `hasNewerGap()` is false and `bottomDistance` is actually near zero
+  - whether mounted-window recomputation runs after the bottom write, not just before it
+- Cross-chat stale work:
+  - pending batch completion after navigation
+  - pending scroll-idle callback from the prior chat
+- Mounted/core geometry:
+  - `core.start/end`
+  - `mounted.start/end`
+  - spacer heights versus visible rows
