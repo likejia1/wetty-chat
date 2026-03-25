@@ -28,7 +28,7 @@ export function MeasuredRow({ rowKey, hidden = false, onMeasure, registerRow, ch
     if (!node) return;
 
     const ro = new ResizeObserver(() => {
-      const height = node.getBoundingClientRect().height;
+      const height = Math.round(node.getBoundingClientRect().height);
       if (height > 0) {
         onMeasure(rowKey, height);
       }

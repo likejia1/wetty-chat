@@ -29,7 +29,9 @@ A contiguous subset of rows that have been measured and participate in scroll ge
 The height cache is **never pruned** — it persists for the lifetime of the chat session. When core is pruned, heights remain in the cache. Re-expansion of previously measured regions is instant (no staging needed).
 
 ### Tier 3: Mounted window (`MountedWindow { start, end }`)
-A contiguous subset of the core with actual DOM nodes. Bounded by `MOUNT_CAP` (~80 rows). Rows in the core but outside the mounted window use spacers with their exact measured heights.
+A contiguous subset of the core with actual DOM nodes. Normally bounded by `MOUNT_CAP` (~80 rows). Rows in the core but outside the mounted window use spacers with their exact measured heights.
+
+If the core still contains uncached rows, the mounted window is allowed to temporarily exceed `MOUNT_CAP` so those rows stay mounted until measured. This avoids zero-height spacer fallbacks and keeps scroll geometry stable.
 
 ## Row Model
 
@@ -59,13 +61,13 @@ WAITING_VIEWPORT  -->  BOOTSTRAP  -->  READY
 
 **Solution**: `handleScroll` only does mounted window recomputation (which rows within the existing core to render). All core expansion happens in `handleScrollIdle` (150ms debounce after last scroll event). This means the user momentum-scrolls freely without any `scrollTop` interference.
 
-### 2. Network loads deferred to scroll idle with one-shot arming
+### 2. Exact-edge loads deferred to scroll idle with one-shot arming
 
 **Problem**: Triggering `loadOlder.onLoad()` during active scrolling caused two issues:
-1. After fetch + prepend + local expansion, user is still near top -> immediate re-fetch -> infinite loop
+1. After fetch + prepend + local expansion, user is still parked at top -> immediate re-fetch -> infinite loop
 2. After fetch + prepend, user is stopped at top with no scroll events -> new rows never expand
 
-**Solution**: Network fetches are deferred to scroll idle (`handleScrollIdle`), gated by a one-shot arm (`topLoadArmedRef`/`bottomLoadArmedRef`). The arm is set to `false` after a load fires and only re-armed when the user scrolls away from the edge (`scrollDistFromTop >= VIEWPORT_TRIGGER_PX`). This prevents re-triggering while the user is parked at the edge.
+**Solution**: Network fetches are deferred to scroll idle (`handleScrollIdle`), but they now fire only when the user reaches the exact top or bottom edge of the current content. A one-shot arm (`topLoadArmedRef`/`bottomLoadArmedRef`) is set to `false` after a load fires and only re-armed after the user leaves the edge by a small hysteresis distance. This prevents re-triggering while the user is parked at the edge without reintroducing eager near-edge loading.
 
 ### 3. Immediate store commit for prepends (no buffering)
 
@@ -73,13 +75,13 @@ WAITING_VIEWPORT  -->  BOOTSTRAP  -->  READY
 
 **Solution**: `prependMessages` dispatches to the store immediately. The virtualizer handles the visual timing — new rows enter the core via normal staging batches. The store is never stale.
 
-### 4. Render-time index adjustment for prepends
+### 4. Render-time index adjustment plus anchor restoration for prepends
 
 **Problem**: When `rowKeys` changes due to prepend, array indices shift but `coreRef` and `mountedRef` still hold old indices. If not corrected before JSX is produced, the component renders the wrong rows (shows prepended/older messages instead of the ones the user was looking at).
 
 **Why `useEffect` doesn't work**: The layout effect updates `prevKeysRef` before the mutation `useEffect` reads it, so the mutation effect never detects the prepend. Even if it did, `useEffect` runs after render — too late.
 
-**Solution**: A synchronous block during the render phase (before JSX) detects prepend via `classifyKeyMutation` using a separate `adjustPrevKeysRef`, then shifts `core.start/end` and `mounted.start/end` by the prepend count. This only fires when `rowKeys` reference changes (store update), NOT on internal re-renders from `triggerRender()`.
+**Solution**: A synchronous block during the render phase (before JSX) detects prepend via `classifyKeyMutation` using a separate `adjustPrevKeysRef`, captures the first visible mounted row as an anchor, then shifts `core.start/end` and `mounted.start/end` by the prepend count. In `useLayoutEffect`, the virtualizer restores that anchor row to the same viewport offset. This only fires when `rowKeys` reference changes (store update), NOT on internal re-renders from `triggerRender()`.
 
 **Important**: An earlier attempt used key-based re-alignment (tracking `coreStartKeyRef`/`coreEndKeyRef` and re-resolving indices every render). This caused an infinite loop because it couldn't distinguish "indices changed due to prepend" from "indices changed due to normal core expansion" — it would undo expansions on every render.
 
@@ -112,6 +114,18 @@ WAITING_VIEWPORT  -->  BOOTSTRAP  -->  READY
 **Problem**: `scrollToBottom()` checked `hasNewerGap()` first. If the core didn't extend to the last row, it called `maybeExpandOrQueue('forward')` and returned without scrolling — the user perceived the first click as doing nothing.
 
 **Solution**: Always call `scrollToBottomInternal()` immediately for visual feedback. Then, if there's a newer gap, expand toward it asynchronously. `pendingScrollToBottomRef` ensures we snap to the true bottom when expansion completes.
+
+### 9. Bottom anchoring needs a settle pass on iOS Safari
+
+**Problem**: On iOS Safari, the initial bottom snap could land "almost bottom" after the first ready render because the scroll container height and top chrome rows were not fully settled when the first `scrollTop` assignment happened.
+
+**Solution**: Bottom-directed actions (`initialAnchor.type === 'bottom'`, append-at-bottom, explicit `scrollToBottom`) perform the immediate snap and then schedule a short post-layout settle pass over the next animation frames. This reconciles Safari's delayed layout without changing the measured-core model.
+
+### 10. Unmeasured core rows must never fall back to spacers
+
+**Problem**: During active scrolling, the mounted window could shift away from the top of the core before a few newly introduced rows had been measured. Those rows then contributed `0` through spacer math on one render and their real DOM height on the next, making `scrollHeight` oscillate and causing visible scrollbar jitter.
+
+**Solution**: `useMountedWindow` treats `MOUNT_CAP` as a soft cap when the current core still contains uncached rows. Any unmeasured rows inside the core stay inside the mounted window until they receive exact heights. Only fully measured rows may be virtualized into top/bottom spacers.
 
 ## File Structure
 
@@ -148,8 +162,10 @@ src/components/chat/virtualScroll/
 
 1. **Only measured heights in scroll geometry** — no estimates contribute to spacer heights or scroll range
 2. **Stable row keys are the source of truth** — mutation classification, index adjustment, and height caching all key off `msg:` prefixed keys
-3. **Prepend preservation happens before paint** — index shifting in render phase, scroll adjustment in `useLayoutEffect`
+3. **Prepend preservation happens before paint** — index shifting in render phase, anchor restoration in `useLayoutEffect`
 4. **No scrollTop adjustments during active scrolling** — all core expansion deferred to scroll idle
-5. **Network loading is parent policy** — virtualizer reports geometry, `chat-thread.tsx` decides when to fetch
-6. **Height cache persists** — measurement work is never discarded, only the core range is bounded
-7. **Optimistic confirmation must not remount a row** — `client_generated_id` is stable across confirmation
+5. **Edge expansion/loading is exact-edge only** — no eager near-edge expansion or fetches
+6. **Network loading is parent policy** — virtualizer reports geometry, `chat-thread.tsx` decides when to fetch
+7. **Unmeasured core rows stay mounted** — only rows with exact cached heights may move into spacers
+8. **Height cache persists** — measurement work is never discarded, only the core range is bounded
+9. **Optimistic confirmation must not remount a row** — `client_generated_id` is stable across confirmation

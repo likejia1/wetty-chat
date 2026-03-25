@@ -17,6 +17,24 @@ export function useMountedWindow(
 ): MountedWindowResult {
   const mountedRef = useRef<MountedWindow | null>(null);
 
+  const findUnmeasuredSpan = useCallback(
+    (core: CoreRange): MountedWindow | null => {
+      let firstMissing = -1;
+      let lastMissing = -1;
+
+      for (let i = core.start; i <= core.end; i++) {
+        if (heightCache.has(rowKeys[i])) continue;
+        if (firstMissing === -1) {
+          firstMissing = i;
+        }
+        lastMissing = i;
+      }
+
+      return firstMissing === -1 ? null : { start: firstMissing, end: lastMissing };
+    },
+    [heightCache, rowKeys],
+  );
+
   const recomputeMounted = useCallback(
     (core: CoreRange, scrollTop: number, viewportHeight: number, topChromeHeight: number) => {
       const mounted = mountedRef.current;
@@ -54,8 +72,14 @@ export function useMountedWindow(
 
       const newStart = Math.max(core.start, visibleStart - MOUNT_OVERSCAN);
       const newEnd = Math.min(core.end, visibleEnd + MOUNT_OVERSCAN);
+      const unmeasuredSpan = findUnmeasuredSpan(core);
 
-      if (newEnd - newStart + 1 > MOUNT_CAP) {
+      // Unmeasured core rows must stay mounted until they have exact heights.
+      // Otherwise they fall back to zero-height spacers and the scroll geometry oscillates.
+      const requiredStart = unmeasuredSpan ? Math.min(newStart, unmeasuredSpan.start) : newStart;
+      const requiredEnd = unmeasuredSpan ? Math.max(newEnd, unmeasuredSpan.end) : newEnd;
+
+      if (!unmeasuredSpan && requiredEnd - requiredStart + 1 > MOUNT_CAP) {
         const center = Math.floor((visibleStart + visibleEnd) / 2);
         const halfCap = Math.floor(MOUNT_CAP / 2);
         const cappedStart = Math.max(core.start, center - halfCap);
@@ -65,9 +89,9 @@ export function useMountedWindow(
       }
 
       if (mounted) {
-        const expandedStart = Math.min(mounted.start, newStart);
-        const expandedEnd = Math.max(mounted.end, newEnd);
-        if (expandedEnd - expandedStart + 1 <= MOUNT_CAP) {
+        const expandedStart = Math.min(mounted.start, requiredStart);
+        const expandedEnd = Math.max(mounted.end, requiredEnd);
+        if (unmeasuredSpan || expandedEnd - expandedStart + 1 <= MOUNT_CAP) {
           mountedRef.current = {
             start: Math.max(core.start, expandedStart),
             end: Math.min(core.end, expandedEnd),
@@ -76,9 +100,9 @@ export function useMountedWindow(
         }
       }
 
-      mountedRef.current = { start: newStart, end: newEnd };
+      mountedRef.current = { start: requiredStart, end: requiredEnd };
     },
-    [heightCache, rowKeys],
+    [findUnmeasuredSpan, heightCache, rowKeys],
   );
 
   const resetMounted = useCallback((core: CoreRange) => {
