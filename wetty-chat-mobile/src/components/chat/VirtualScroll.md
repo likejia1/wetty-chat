@@ -16,7 +16,7 @@ This means:
 - No estimate-to-real correction ever needed in the visible area
 - No programmatic `scrollTop` adjustment for measurement corrections
 - The scroll thumb won't represent the full chat history (acceptable for chat)
-- `scrollTop` adjustment is ONLY needed for prepend preservation (adding measured height above viewport)
+- `scrollTop` adjustment is only used to preserve the visible viewport when measured content is inserted above it
 
 ## Three-Tier Data Model
 
@@ -69,6 +69,8 @@ WAITING_VIEWPORT  -->  BOOTSTRAP  -->  READY
 
 **Solution**: Network fetches are deferred to scroll idle (`handleScrollIdle`), but they now fire only when the user reaches the exact top or bottom edge of the current content. A one-shot arm (`topLoadArmedRef`/`bottomLoadArmedRef`) is set to `false` after a load fires and only re-armed after the user leaves the edge by a small hysteresis distance. This prevents re-triggering while the user is parked at the edge without reintroducing eager near-edge loading.
 
+Important: exact-edge detection controls only **when** loading is allowed. It does **not** change the scroll-preservation policy after rows are inserted. Once older rows arrive, prepend handling and backward core expansion still preserve the visible anchor instead of pinning the viewport to the top of the newly loaded page.
+
 ### 3. Immediate store commit for prepends (no buffering)
 
 **Problem**: The V2 code buffered prepend data in `pendingPrependRef` until scroll idle. This caused "one bad commit" issues where the virtualizer's key arrays were out of sync with the store.
@@ -81,7 +83,7 @@ WAITING_VIEWPORT  -->  BOOTSTRAP  -->  READY
 
 **Why `useEffect` doesn't work**: The layout effect updates `prevKeysRef` before the mutation `useEffect` reads it, so the mutation effect never detects the prepend. Even if it did, `useEffect` runs after render — too late.
 
-**Solution**: A synchronous block during the render phase (before JSX) detects prepend via `classifyKeyMutation` using a separate `adjustPrevKeysRef`, captures the first visible mounted row as an anchor, then shifts `core.start/end` and `mounted.start/end` by the prepend count. In `useLayoutEffect`, the virtualizer restores that anchor row to the same viewport offset. This only fires when `rowKeys` reference changes (store update), NOT on internal re-renders from `triggerRender()`.
+**Solution**: A synchronous block during the render phase (before JSX) detects prepend via `classifyKeyMutation` using a separate `adjustPrevKeysRef`, captures the first visible mounted row as an anchor, then shifts `core.start/end` and `mounted.start/end` by the prepend count. In `useLayoutEffect`, the virtualizer restores that anchor row to the same viewport offset. Anchor capture prefers visible `msg:` rows over date separators so prepend restoration tracks user-visible message content instead of structural chrome. This only fires when `rowKeys` reference changes (store update), NOT on internal re-renders from `triggerRender()`.
 
 **Important**: An earlier attempt used key-based re-alignment (tracking `coreStartKeyRef`/`coreEndKeyRef` and re-resolving indices every render). This caused an infinite loop because it couldn't distinguish "indices changed due to prepend" from "indices changed due to normal core expansion" — it would undo expansions on every render.
 

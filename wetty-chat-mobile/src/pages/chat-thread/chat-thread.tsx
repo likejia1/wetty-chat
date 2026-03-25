@@ -288,6 +288,14 @@ function ChatThreadCore({ chatId, threadId, backAction }: ChatThreadCoreProps) {
       .then((res) => {
         if (selectChatGeneration(store.getState(), storeChatId) !== gen) return;
         const list = res.data.messages ?? [];
+        if (import.meta.env.DEV) {
+          console.log('[ChatThread] loadMore resolved', {
+            fetchedCount: list.length,
+            oldestId: list[0]?.id ?? null,
+            newestId: list[list.length - 1]?.id ?? null,
+            nextCursor: res.data.next_cursor ?? null,
+          });
+        }
         dispatch(prependMessages({ chatId: storeChatId, messages: list, nextCursor: res.data.next_cursor ?? null }));
         loadingMoreRef.current = false;
         setLoadingMore(false);

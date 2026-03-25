@@ -1,5 +1,4 @@
 import { type ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { flushSync } from 'react-dom';
 import { HeightCache } from './virtualScroll/heightCache';
 import { MeasuredRow } from './virtualScroll/MeasuredRow';
 import { useCoreManager } from './virtualScroll/useCoreManager';
@@ -74,6 +73,12 @@ function roundScrollValue(value: number): number {
 
 function hasMeaningfulScrollDelta(current: number, next: number): boolean {
   return Math.abs(next - current) >= 1;
+}
+
+function scrollDirection(from: number, to: number): 'up' | 'down' | 'none' {
+  if (to > from) return 'down';
+  if (to < from) return 'up';
+  return 'none';
 }
 
 // ── Component ──
@@ -308,6 +313,12 @@ export function ChatVirtualScroll({
     if (!container) return;
     const target = roundScrollValue(container.scrollHeight - container.clientHeight);
     if (!hasMeaningfulScrollDelta(container.scrollTop, target)) return;
+    logVirtualScroll('scroll-position-write', {
+      source: 'scrollToBottomInternal',
+      from: container.scrollTop,
+      to: target,
+      direction: scrollDirection(container.scrollTop, target),
+    });
     container.scrollTop = target;
   }, []);
 
@@ -329,6 +340,14 @@ export function ChatVirtualScroll({
     const maxScrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
     const nextScrollTop = roundScrollValue(Math.max(0, Math.min(target, maxScrollTop)));
     if (!hasMeaningfulScrollDelta(container.scrollTop, nextScrollTop)) return true;
+    logVirtualScroll('scroll-position-write', {
+      source: 'restoreAnchorOffset',
+      key,
+      offsetTop,
+      from: container.scrollTop,
+      to: nextScrollTop,
+      direction: scrollDirection(container.scrollTop, nextScrollTop),
+    });
     container.scrollTop = nextScrollTop;
     return true;
   }, []);
@@ -339,6 +358,7 @@ export function ChatVirtualScroll({
     if (!container || !mounted) return null;
 
     const containerRect = container.getBoundingClientRect();
+    let fallbackAnchor: { key: string; offsetTop: number } | null = null;
     for (let i = mounted.start; i <= mounted.end; i++) {
       const key = rowKeys[i];
       if (!key) continue;
@@ -347,10 +367,12 @@ export function ChatVirtualScroll({
 
       const rect = row.getBoundingClientRect();
       if (rect.bottom <= containerRect.top || rect.top >= containerRect.bottom) continue;
-      return { key, offsetTop: roundScrollValue(rect.top - containerRect.top) };
+      const anchor = { key, offsetTop: roundScrollValue(rect.top - containerRect.top) };
+      if (key.startsWith('msg:')) return anchor;
+      if (!fallbackAnchor) fallbackAnchor = anchor;
     }
 
-    return null;
+    return fallbackAnchor;
   }, [mountedRef, rowKeys]);
 
   const scrollDistances = useCallback(() => {
@@ -630,6 +652,13 @@ export function ChatVirtualScroll({
     if (intent?.preserveHeightDelta && intent.preserveHeightDelta !== 0) {
       const nextScrollTop = roundScrollValue(container.scrollTop + intent.preserveHeightDelta);
       if (hasMeaningfulScrollDelta(container.scrollTop, nextScrollTop)) {
+        logVirtualScroll('scroll-position-write', {
+          source: 'preserveHeightDelta',
+          preserveHeightDelta: intent.preserveHeightDelta,
+          from: container.scrollTop,
+          to: nextScrollTop,
+          direction: scrollDirection(container.scrollTop, nextScrollTop),
+        });
         container.scrollTop = nextScrollTop;
       }
     }
@@ -659,8 +688,17 @@ export function ChatVirtualScroll({
 
     const pendingPrependRestore = pendingPrependRestoreRef.current;
     if (pendingPrependRestore) {
+      logVirtualScroll('prepend-restore-attempt', {
+        key: pendingPrependRestore.key,
+        offsetTop: pendingPrependRestore.offsetTop,
+        scrollTopBefore: container.scrollTop,
+      });
       const restored = restoreAnchorOffset(pendingPrependRestore.key, pendingPrependRestore.offsetTop);
       if (restored) {
+        logVirtualScroll('prepend-restore-complete', {
+          key: pendingPrependRestore.key,
+          scrollTopAfter: container.scrollTop,
+        });
         pendingPrependRestoreRef.current = null;
       }
     }
@@ -738,6 +776,7 @@ export function ChatVirtualScroll({
 
   useEffect(() => {
     const anchor = initialAnchorRef.current;
+    const container = containerRef.current;
 
     // Reset all state
     rowRefsMap.current.clear();
@@ -755,11 +794,11 @@ export function ChatVirtualScroll({
     prevKeysRef.current = rowKeys;
     resetCore({ start: 0, end: -1 }); // empty core
     mountedRef.current = null;
-
-    flushSync(() => {
-      setPhaseState(containerHeight > 0 ? 'BOOTSTRAP' : 'WAITING_VIEWPORT');
-      triggerRender();
-    });
+    if (container) {
+      container.scrollTop = 0;
+    }
+    setPhaseState(containerHeight > 0 ? 'BOOTSTRAP' : 'WAITING_VIEWPORT');
+    triggerRender();
 
     isAtBottomRef.current = anchor.type === 'bottom';
     onAtBottomChange?.(anchor.type === 'bottom');
@@ -966,6 +1005,9 @@ export function ChatVirtualScroll({
     if (adjustPrevKeysRef.current.length > 0) {
       const mut = classifyKeyMutation(adjustPrevKeysRef.current, rowKeys);
       if (mut === 'prepend') {
+        logVirtualScroll('prepend-detected', {
+          prependCount: rowKeys.length - adjustPrevKeysRef.current.length,
+        });
         pendingPrependRestoreRef.current = captureVisibleAnchor();
         const prependCount = rowKeys.length - adjustPrevKeysRef.current.length;
         const core = coreRef.current;
@@ -1037,7 +1079,7 @@ export function ChatVirtualScroll({
         )}
         {showTopBoundary && (
           <div className={styles.boundaryRow} style={{ height: BOUNDARY_HEIGHT_PX }}>
-            Loading…
+            Earlier messages
           </div>
         )}
         {topSpacer > 0 && <div className={styles.spacer} style={{ height: topSpacer }} />}
@@ -1045,7 +1087,7 @@ export function ChatVirtualScroll({
         {bottomSpacer > 0 && <div className={styles.spacer} style={{ height: bottomSpacer }} />}
         {showBottomBoundary && (
           <div className={styles.boundaryRow} style={{ height: BOUNDARY_HEIGHT_PX }}>
-            Loading…
+            Newer messages
           </div>
         )}
         <div className={styles.stagingArea}>{stagingRows}</div>
