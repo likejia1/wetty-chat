@@ -21,6 +21,7 @@
     "@lingui/core": "^5.9.2",
     "@lingui/react": "^5.9.2",
     "@reduxjs/toolkit": "^2.11.2",
+    "@tanstack/react-virtual": "^3.13.23",
     "axios": "^1.13.6",
     "ionicons": "^8.0.13",
     "js-cookie": "^3.0.5",

@@ -1,7 +1,9 @@
 .container {
+  position: relative;
   width: 100%;
   height: 100%;
   overflow-y: auto;
+  overflow-anchor: none;
   -webkit-overflow-scrolling: touch;
 }
 
@@ -12,37 +14,26 @@
 }
 
 .flowItem {
-  width: 100%;
-}
-
-.spacer {
-  width: 100%;
-}
-
-.boundaryRow {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 0.85em;
-  color: var(--ion-color-medium, #888);
-}
-
-.loadingRow {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 0.85em;
-  color: var(--ion-color-medium, #888);
-}
-
-.stagingArea {
   position: absolute;
-  inset: 0;
-  pointer-events: none;
-  visibility: hidden;
-  z-index: -1;
+  top: 0;
+  left: 0;
+  width: 100%;
 }
 
 .stagingItem {
   width: 100%;
+}
+
+.loadingRow {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 32px;
+  padding: 4px 12px;
+  font-size: 0.85em;
+  color: var(--ion-color-medium, #888);
+  background: color-mix(in srgb, var(--ion-background-color, #fff) 90%, transparent);
 }
